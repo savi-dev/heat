@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,7 +11,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
+
 from requests import exceptions
+import six
 
 from heat.common import exception
 from heat.common import template_format
@@ -24,9 +25,21 @@ from heat.engine import properties
 from heat.engine import stack_resource
 from heat.engine import template
 
-from heat.openstack.common import log as logging
 
-logger = logging.getLogger(__name__)
+def generate_class(name, template_name):
+    try:
+        data = urlfetch.get(template_name, allowed_schemes=('file',))
+    except IOError:
+        return TemplateResource
+    tmpl = template.Template(template_format.parse(data))
+    properties_schema = properties.Properties.schema_from_params(
+        tmpl.param_schemata())
+    attributes_schema = attributes.Attributes.schema_from_outputs(
+        tmpl[tmpl.OUTPUTS])
+    cls = type(name, (TemplateResource,),
+               {"properties_schema": properties_schema,
+                "attributes_schema": attributes_schema})
+    return cls
 
 
 class TemplateResource(stack_resource.StackResource):
@@ -46,30 +59,46 @@ class TemplateResource(stack_resource.StackResource):
         tri = stack.env.get_resource_info(
             json_snippet['Type'],
             registry_type=environment.TemplateResourceInfo)
-        self.template_name = tri.template_name
-        if tri.user_resource:
-            self.allowed_schemes = ('http', 'https')
+        if tri is None:
+            self.validation_exception = ValueError(_(
+                'Only Templates with an extension of .yaml or '
+                '.template are supported'))
         else:
-            self.allowed_schemes = ('http', 'https', 'file')
+            self.template_name = tri.template_name
+            if tri.user_resource:
+                self.allowed_schemes = ('http', 'https')
+            else:
+                self.allowed_schemes = ('http', 'https', 'file')
 
-        # parse_nested can fail if the URL in the environment is bad
-        # or otherwise inaccessible.  Suppress the error here so the
-        # stack can be deleted, and detect it at validate/create time
-        try:
-            tmpl = template.Template(self.parsed_nested)
-        except ValueError as parse_error:
-            self.validation_exception = parse_error
-            tmpl = template.Template({})
-
-        self.properties_schema = (properties.Properties
-            .schema_from_params(tmpl.param_schemata()))
-        self.attributes_schema = (attributes.Attributes
-            .schema_from_outputs(tmpl[template.OUTPUTS]))
-        self.update_allowed_keys = ('Properties',)
-
+        # run Resource.__init__() so we can call self.nested()
+        self.properties_schema = {}
+        self.attributes_schema = {}
         super(TemplateResource, self).__init__(name, json_snippet, stack)
+        if self.validation_exception is None:
+            self._generate_schema(self.t)
 
-    def _to_parameters(self):
+    def _generate_schema(self, definition):
+        self._parsed_nested = None
+        try:
+            tmpl = template.Template(self.child_template())
+        except ValueError as download_error:
+            self.validation_exception = download_error
+            tmpl = template.Template(
+                {"HeatTemplateFormatVersion": "2012-12-12"})
+
+        # re-generate the properties and attributes from the template.
+        self.properties_schema = (properties.Properties
+                                  .schema_from_params(tmpl.param_schemata()))
+        self.attributes_schema = (attributes.Attributes
+                                  .schema_from_outputs(tmpl[tmpl.OUTPUTS]))
+
+        self.properties = definition.properties(self.properties_schema,
+                                                self.context)
+        self.attributes = attributes.Attributes(self.name,
+                                                self.attributes_schema,
+                                                self._resolve_attribute)
+
+    def child_params(self):
         '''
         :return: parameter values for our nested stack based on our properties
         '''
@@ -78,10 +107,18 @@ class TemplateResource(stack_resource.StackResource):
             if not pval.implemented():
                 continue
 
-            val = self.properties[pname]
+            try:
+                val = self.properties[pname]
+            except ValueError:
+                if self.action == self.INIT:
+                    prop = self.properties.props[pname]
+                    val = prop.get_value(None)
+                else:
+                    raise
+
             if val is not None:
                 # take a list and create a CommaDelimitedList
-                if pval.type() == properties.LIST:
+                if pval.type() == properties.Schema.LIST:
                     if len(val) == 0:
                         params[pname] = ''
                     elif isinstance(val[0], dict):
@@ -101,69 +138,87 @@ class TemplateResource(stack_resource.StackResource):
 
         return params
 
-    @property
-    def parsed_nested(self):
+    def child_template(self):
         if not self._parsed_nested:
-            self._parsed_nested = template_format.parse(self.template_data)
+            self._parsed_nested = template_format.parse(self.template_data())
         return self._parsed_nested
 
-    @property
+    def implementation_signature(self):
+        self._generate_schema(self.t)
+        return super(TemplateResource, self).implementation_signature()
+
     def template_data(self):
+        # we want to have the latest possible template.
+        # 1. look in files
+        # 2. try download
+        # 3. look in the db
+        reported_excp = None
         t_data = self.stack.t.files.get(self.template_name)
         if not t_data and self.template_name.endswith((".yaml", ".template")):
             try:
                 t_data = urlfetch.get(self.template_name,
                                       allowed_schemes=self.allowed_schemes)
             except (exceptions.RequestException, IOError) as r_exc:
-                raise ValueError("Could not fetch remote template '%s': %s" %
-                                 (self.template_name, str(r_exc)))
-            else:
-                # TODO(Randall) Whoops, misunderstanding on my part; this
-                # doesn't actually persist to the db like I thought.
-                # Find a better way
-                self.stack.t.files[self.template_name] = t_data
-        return t_data
+                reported_excp = ValueError(_("Could not fetch remote template "
+                                             "'%(name)s': %(exc)s") % {
+                                                 'name': self.template_name,
+                                                 'exc': str(r_exc)})
+
+        if t_data is None:
+            if self.nested() is not None:
+                t_data = json.dumps(self.nested().t.t)
+
+        if t_data is not None:
+            self.stack.t.files[self.template_name] = t_data
+            return t_data
+        if reported_excp is None:
+            reported_excp = ValueError(_('Unknown error retrieving %s') %
+                                       self.template_name)
+        raise reported_excp
 
     def _validate_against_facade(self, facade_cls):
         facade_schemata = properties.schemata(facade_cls.properties_schema)
 
         for n, fs in facade_schemata.items():
             if fs.required and n not in self.properties_schema:
-                msg = ("Required property %s for facade %s "
-                       "missing in provider") % (n, self.type())
+                msg = (_("Required property %(n)s for facade %(type)s "
+                       "missing in provider") % {'n': n, 'type': self.type()})
                 raise exception.StackValidationFailed(message=msg)
 
             ps = self.properties_schema.get(n)
             if (n in self.properties_schema and
-                    (fs.type != ps.type)):
+                    (fs.allowed_param_prop_type() != ps.type)):
                 # Type mismatch
-                msg = ("Property %s type mismatch between facade %s (%s) "
-                       "and provider (%s)") % (n, self.type(),
-                                               fs.type, ps.type)
+                msg = (_("Property %(n)s type mismatch between facade %(type)s"
+                       " (%(fs_type)s) and provider (%(ps_type)s)") % {
+                           'n': n, 'type': self.type(),
+                           'fs_type': fs.type, 'ps_type': ps.type})
                 raise exception.StackValidationFailed(message=msg)
 
         for n, ps in self.properties_schema.items():
             if ps.required and n not in facade_schemata:
                 # Required property for template not present in facade
-                msg = ("Provider requires property %s "
-                       "unknown in facade %s") % (n, self.type())
+                msg = (_("Provider requires property %(n)s "
+                       "unknown in facade %(type)s") % {
+                           'n': n, 'type': self.type()})
                 raise exception.StackValidationFailed(message=msg)
 
         for attr in facade_cls.attributes_schema:
             if attr not in self.attributes_schema:
-                msg = ("Attribute %s for facade %s "
-                       "missing in provider") % (attr, self.type())
+                msg = (_("Attribute %(attr)s for facade %(type)s "
+                       "missing in provider") % {
+                           'attr': attr, 'type': self.type()})
                 raise exception.StackValidationFailed(message=msg)
 
     def validate(self):
         if self.validation_exception is not None:
-            msg = str(self.validation_exception)
+            msg = six.text_type(self.validation_exception)
             raise exception.StackValidationFailed(message=msg)
 
         try:
-            td = self.template_data
+            self.template_data()
         except ValueError as ex:
-            msg = _("Failed to retrieve template data: %s") % str(ex)
+            msg = _("Failed to retrieve template data: %s") % ex
             raise exception.StackValidationFailed(message=msg)
         cri = self.stack.env.get_resource_info(
             self.type(),
@@ -177,20 +232,28 @@ class TemplateResource(stack_resource.StackResource):
 
         return super(TemplateResource, self).validate()
 
+    def handle_adopt(self, resource_data=None):
+        return self.create_with_template(self.child_template(),
+                                         self.child_params(),
+                                         adopt_data=resource_data)
+
+    def check_adopt_complete(self, stack_creator):
+        done = stack_creator.step()
+        if done:
+            if self._nested.state != (self._nested.ADOPT,
+                                      self._nested.COMPLETE):
+                raise exception.Error(self._nested.status_reason)
+
+        return done
+
     def handle_create(self):
-        return self.create_with_template(self.parsed_nested,
-                                         self._to_parameters())
+        return self.create_with_template(self.child_template(),
+                                         self.child_params())
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
-        # The stack template may be changed even if the prop_diff is empty.
-        self.properties = properties.Properties(
-            self.properties_schema,
-            json_snippet.get('Properties', {}),
-            self.stack.resolve_runtime_data,
-            self.name)
-
-        return self.update_with_template(self.parsed_nested,
-                                         self._to_parameters())
+        self._generate_schema(json_snippet)
+        return self.update_with_template(self.child_template(),
+                                         self.child_params())
 
     def handle_delete(self):
         return self.delete_nested()

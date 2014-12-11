@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -16,10 +15,11 @@
 import copy
 
 from heat.common import template_format
-from heat.engine.resources import cloud_watch
 from heat.engine import resource
-from heat.engine import watchrule
+from heat.engine.resources import cloud_watch
+from heat.engine import rsrc_defn
 from heat.engine import scheduler
+from heat.engine import watchrule
 from heat.tests.common import HeatTestCase
 from heat.tests import utils
 
@@ -53,13 +53,13 @@ alarm_template = '''
 class CloudWatchAlarmTest(HeatTestCase):
     def setUp(self):
         super(CloudWatchAlarmTest, self).setUp()
-        utils.setup_dummy_db()
 
     def create_alarm(self, t, stack, resource_name):
+        resource_defns = stack.t.resource_definitions(stack)
         rsrc = cloud_watch.CloudWatchAlarm(resource_name,
-                                           t['Resources'][resource_name],
+                                           resource_defns[resource_name],
                                            stack)
-        self.assertEqual(None, rsrc.validate())
+        self.assertIsNone(rsrc.validate())
         scheduler.TaskRunner(rsrc.create)()
         self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
         return rsrc
@@ -82,13 +82,18 @@ class CloudWatchAlarmTest(HeatTestCase):
 
         self.m.ReplayAll()
         rsrc = self.create_alarm(t, stack, 'MEMAlarmHigh')
-        snippet = copy.deepcopy(rsrc.parsed_template())
-        snippet['Properties']['ComparisonOperator'] = 'LessThanThreshold'
-        snippet['Properties']['AlarmDescription'] = 'fruity'
-        snippet['Properties']['EvaluationPeriods'] = '2'
-        snippet['Properties']['Period'] = '90'
-        snippet['Properties']['Statistic'] = 'Maximum'
-        snippet['Properties']['Threshold'] = '39'
+        props = copy.copy(rsrc.properties.data)
+        props.update({
+            'ComparisonOperator': 'LessThanThreshold',
+            'AlarmDescription': 'fruity',
+            'EvaluationPeriods': '2',
+            'Period': '90',
+            'Statistic': 'Maximum',
+            'Threshold': '39',
+        })
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name,
+                                               rsrc.type(),
+                                               props)
 
         scheduler.TaskRunner(rsrc.update, snippet)()
 
@@ -113,8 +118,11 @@ class CloudWatchAlarmTest(HeatTestCase):
 
         self.m.ReplayAll()
         rsrc = self.create_alarm(t, stack, 'MEMAlarmHigh')
-        snippet = copy.deepcopy(rsrc.parsed_template())
-        snippet['Properties']['MetricName'] = 'temp'
+        props = copy.copy(rsrc.properties.data)
+        props['MetricName'] = 'temp'
+        snippet = rsrc_defn.ResourceDefinition(rsrc.name,
+                                               rsrc.type(),
+                                               props)
 
         updater = scheduler.TaskRunner(rsrc.update, snippet)
         self.assertRaises(resource.UpdateReplace, updater)
@@ -131,22 +139,22 @@ class CloudWatchAlarmTest(HeatTestCase):
         self.m.ReplayAll()
         rsrc = self.create_alarm(t, stack, 'MEMAlarmHigh')
         scheduler.TaskRunner(rsrc.suspend)()
-        self.assertEqual(rsrc.state, (rsrc.SUSPEND, rsrc.COMPLETE))
+        self.assertEqual((rsrc.SUSPEND, rsrc.COMPLETE), rsrc.state)
 
         self.ctx = utils.dummy_context()
 
         wr = watchrule.WatchRule.load(
             self.ctx, watch_name="test_stack-MEMAlarmHigh")
 
-        self.assertEqual(wr.state, watchrule.WatchRule.SUSPENDED)
+        self.assertEqual(watchrule.WatchRule.SUSPENDED, wr.state)
 
         scheduler.TaskRunner(rsrc.resume)()
-        self.assertEqual(rsrc.state, (rsrc.RESUME, rsrc.COMPLETE))
+        self.assertEqual((rsrc.RESUME, rsrc.COMPLETE), rsrc.state)
 
         wr = watchrule.WatchRule.load(
             self.ctx, watch_name="test_stack-MEMAlarmHigh")
 
-        self.assertEqual(wr.state, watchrule.WatchRule.NODATA)
+        self.assertEqual(watchrule.WatchRule.NODATA, wr.state)
 
         scheduler.TaskRunner(rsrc.delete)()
         self.m.VerifyAll()

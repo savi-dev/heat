@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,7 +11,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
 """
 A fake server that "responds" to API methods with pre-canned responses.
 
@@ -21,27 +19,7 @@ wrong the tests might raise AssertionError. I've indicated in comments the
 places where actual behavior differs from the spec.
 """
 
-
-def assert_has_keys(a_dict, required=(), optional=()):
-    """Raise an assertion if a_dict has the wrong keys.
-
-    :param a_dict: A dict to look for keys in.
-    :param required: An iterable of keys that must be present.
-    :param optional: An iterable of keys that may be present.
-
-    If any key from required is missing, an AssertionError will be raised.
-    If any key other than those from required + optional is present, an
-    AssertionError will be raised.
-    """
-    keys = set(a_dict.keys())
-    required = set(required)
-    optional = set(optional)
-    missing = required - keys
-    extra = keys - (required | optional)
-    if missing or extra:
-        raise AssertionError(
-            "Missing keys %r, with extra keys %r in %r" %
-            (missing, extra, keys))
+from heat.common import context
 
 
 class FakeClient(object):
@@ -98,14 +76,23 @@ class FakeClient(object):
 
 
 class FakeKeystoneClient(object):
-    def __init__(self, username='test_user', user_id='1234', access='4567',
-                 secret='8901'):
+    def __init__(self, username='test_user', password='apassword',
+                 user_id='1234', access='4567', secret='8901',
+                 credential_id='abcdxyz', auth_token='abcd1234'):
         self.username = username
+        self.password = password
         self.user_id = user_id
         self.access = access
         self.secret = secret
-        self.creds = None
-        self.auth_token = 'abcd1234'
+        self.credential_id = credential_id
+
+        class FakeCred(object):
+            id = self.credential_id
+            access = self.access
+            secret = self.secret
+        self.creds = FakeCred()
+
+        self.auth_token = auth_token
 
     def create_stack_user(self, username, password=''):
         self.username = username
@@ -114,16 +101,21 @@ class FakeKeystoneClient(object):
     def delete_stack_user(self, user_id):
         self.user_id = None
 
-    def get_ec2_keypair(self, user_id):
+    def get_ec2_keypair(self, access, user_id):
         if user_id == self.user_id:
-            if not self.creds:
-                class FakeCred(object):
-                    access = self.access
-                    secret = self.secret
-                self.creds = FakeCred()
+            if access == self.access:
+                return self.creds
+            else:
+                raise ValueError("Unexpected access %s" % access)
+        else:
+            raise ValueError("Unexpected user_id %s" % user_id)
+
+    def create_ec2_keypair(self, user_id):
+        if user_id == self.user_id:
             return self.creds
 
-    def delete_ec2_keypair(self, user_id, access):
+    def delete_ec2_keypair(self, credential_id=None, user_id=None,
+                           access=None):
         if user_id == self.user_id and access == self.creds.access:
             self.creds = None
         else:
@@ -139,7 +131,39 @@ class FakeKeystoneClient(object):
         return 'http://example.com:1234/v1'
 
     def create_trust_context(self):
+        return context.RequestContext(username=self.username,
+                                      password=self.password,
+                                      is_admin=False,
+                                      trust_id='atrust',
+                                      trustor_user_id=self.user_id)
+
+    def delete_trust(self, trust_id):
         pass
 
-    def delete_trust_context(self):
+    def delete_stack_domain_project(self, project_id):
         pass
+
+    def create_stack_domain_project(self, stack_id):
+        return 'aprojectid'
+
+    def create_stack_domain_user(self, username, project_id, password=None):
+        return self.user_id
+
+    def delete_stack_domain_user(self, user_id, project_id):
+        pass
+
+    def create_stack_domain_user_keypair(self, user_id, project_id):
+        return self.creds
+
+    def enable_stack_domain_user(self, user_id, project_id):
+        pass
+
+    def disable_stack_domain_user(self, user_id, project_id):
+        pass
+
+    def delete_stack_domain_user_keypair(self, user_id, project_id,
+                                         credential_id):
+        pass
+
+    def stack_domain_user_token(self, username, project_id, password):
+        return 'adomainusertoken'

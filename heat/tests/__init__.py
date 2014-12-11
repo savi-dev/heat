@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,7 +11,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# See http://code.google.com/p/python-nose/issues/detail?id=373
-# The code below enables nosetests to work with i18n _() blocks
-import __builtin__
-setattr(__builtin__, '_', lambda x: x)
+from oslo import i18n
+
+
+def fake_translate_msgid(msgid, domain, desired_locale=None):
+    return msgid
+
+i18n.enable_lazy()
+# fixme(elynn): Since install() is deprecated, we should remove it in
+# the future
+i18n.install('heat')
+
+#To ensure messages don't really get translated while running tests.
+#As there are lots of places where matching is expected when comparing
+#exception message(translated) with raw message.
+i18n._translate_msgid = fake_translate_msgid

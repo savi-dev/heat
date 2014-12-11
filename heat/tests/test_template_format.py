@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,20 +11,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
 import os
-import testtools
-import testscenarios
+
+import mock
+import six
 import yaml
 
-from heat.engine import clients
 from heat.common import config
 from heat.common import exception
 from heat.common import template_format
 from heat.tests.common import HeatTestCase
 from heat.tests import utils
-
-load_tests = testscenarios.load_tests_apply_scenarios
 
 
 class JsonToYamlTest(HeatTestCase):
@@ -63,8 +59,6 @@ class JsonToYamlTest(HeatTestCase):
         del(yml[u'HeatTemplateFormatVersion'])
 
         jsn = template_format.parse(json_str)
-        template_format.default_for_missing(jsn, 'AWSTemplateFormatVersion',
-                                            template_format.CFN_VERSIONS)
 
         if u'AWSTemplateFormatVersion' in jsn:
             del(jsn[u'AWSTemplateFormatVersion'])
@@ -84,20 +78,14 @@ class JsonToYamlTest(HeatTestCase):
 
 class YamlMinimalTest(HeatTestCase):
 
-    def test_minimal_yaml(self):
-        yaml1 = ''
-        yaml2 = '''HeatTemplateFormatVersion: '2012-12-12'
-Parameters: {}
-Mappings: {}
-Resources: {}
-Outputs: {}
-'''
-        tpl1 = template_format.parse(yaml1)
-        tpl2 = template_format.parse(yaml2)
-        self.assertEqual(tpl1, tpl2)
+    def _parse_template(self, tmpl_str, msg_str):
+        parse_ex = self.assertRaises(ValueError,
+                                     template_format.parse,
+                                     tmpl_str)
+        self.assertIn(msg_str, six.text_type(parse_ex))
 
     def test_long_yaml(self):
-        template = {'HeatTemplateVersion': '2012-12-12'}
+        template = {'HeatTemplateFormatVersion': '2012-12-12'}
         config.cfg.CONF.set_override('max_template_size', 1024)
         template['Resources'] = ['a'] * (config.cfg.CONF.max_template_size / 3)
         limit = config.cfg.CONF.max_template_size
@@ -105,8 +93,44 @@ Outputs: {}
         self.assertTrue(len(long_yaml) > limit)
         ex = self.assertRaises(exception.RequestLimitExceeded,
                                template_format.parse, long_yaml)
-        msg = 'Request limit exceeded: Template exceeds maximum allowed size.'
-        self.assertEqual(msg, str(ex))
+        msg = ('Request limit exceeded: Template exceeds maximum allowed size '
+               '(1024 bytes)')
+        self.assertEqual(msg, six.text_type(ex))
+
+    def test_parse_no_version_format(self):
+        yaml = ''
+        self._parse_template(yaml, 'Template format version not found')
+        yaml2 = '''Parameters: {}
+Mappings: {}
+Resources: {}
+Outputs: {}
+'''
+        self._parse_template(yaml2, 'Template format version not found')
+
+    def test_parse_string_template(self):
+        tmpl_str = 'just string'
+        msg = 'The template is not a JSON object or YAML mapping.'
+        self._parse_template(tmpl_str, msg)
+
+    def test_parse_invalid_yaml_and_json_template(self):
+        tmpl_str = '{test'
+        msg = 'line 1, column 1'
+        self._parse_template(tmpl_str, msg)
+
+    def test_parse_json_document(self):
+        tmpl_str = '["foo" , "bar"]'
+        msg = 'The template is not a JSON object or YAML mapping.'
+        self._parse_template(tmpl_str, msg)
+
+    def test_parse_empty_json_template(self):
+        tmpl_str = '{}'
+        msg = 'Template format version not found'
+        self._parse_template(tmpl_str, msg)
+
+    def test_parse_yaml_template(self):
+        tmpl_str = 'heat_template_version: 2013-05-23'
+        expected = {'heat_template_version': '2013-05-23'}
+        self.assertEqual(expected, template_format.parse(tmpl_str))
 
 
 class YamlParseExceptions(HeatTestCase):
@@ -134,7 +158,6 @@ class JsonYamlResolvedCompareTest(HeatTestCase):
         super(JsonYamlResolvedCompareTest, self).setUp()
         self.longMessage = True
         self.maxDiff = None
-        utils.setup_dummy_db()
 
     def load_template(self, file_name):
         filepath = os.path.join(os.path.dirname(os.path.realpath(__file__)),
@@ -146,13 +169,9 @@ class JsonYamlResolvedCompareTest(HeatTestCase):
 
     def compare_stacks(self, json_file, yaml_file, parameters):
         t1 = self.load_template(json_file)
-        template_format.default_for_missing(t1, 'AWSTemplateFormatVersion',
-                                            template_format.CFN_VERSIONS)
-        del(t1[u'AWSTemplateFormatVersion'])
-
         t2 = self.load_template(yaml_file)
-        del(t2[u'HeatTemplateFormatVersion'])
-
+        del(t1[u'AWSTemplateFormatVersion'])
+        t1[u'HeatTemplateFormatVersion'] = t2[u'HeatTemplateFormatVersion']
         stack1 = utils.parse_stack(t1, parameters)
         stack2 = utils.parse_stack(t2, parameters)
 
@@ -169,8 +188,6 @@ class JsonYamlResolvedCompareTest(HeatTestCase):
         for key in stack1:
             self.assertEqual(stack1[key].t, stack2[key].t)
 
-    @testtools.skipIf(clients.neutronclient is None,
-                      'neutronclient unavailable')
     def test_neutron_resolved(self):
         self.compare_stacks('Neutron.template', 'Neutron.yaml', {})
 

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,12 +12,14 @@
 #    under the License.
 
 import itertools
+
 from webob import exc
 
 from heat.api.openstack.v1 import util
+from heat.common import identifier
+from heat.common import serializers
 from heat.common import wsgi
 from heat.rpc import api as engine_api
-from heat.common import identifier
 from heat.rpc import client as rpc_client
 
 
@@ -73,16 +73,23 @@ class EventController(object):
     WSGI controller for Events in Heat v1 API
     Implements the API actions
     """
+    # Define request scope (must match what is in policy.json)
+    REQUEST_SCOPE = 'events'
 
     def __init__(self, options):
         self.options = options
-        self.engine = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
 
-    def _event_list(self, req, identity,
-                    filter_func=lambda e: True, detail=False):
-        events = self.engine.list_events(req.context,
-                                         identity)
-
+    def _event_list(self, req, identity, filter_func=lambda e: True,
+                    detail=False, filters=None, limit=None, marker=None,
+                    sort_keys=None, sort_dir=None):
+        events = self.rpc_client.list_events(req.context,
+                                             identity,
+                                             filters=filters,
+                                             limit=limit,
+                                             marker=marker,
+                                             sort_keys=sort_keys,
+                                             sort_dir=sort_dir)
         keys = None if detail else summary_keys
 
         return [format_event(req, e, keys) for e in events if filter_func(e)]
@@ -90,15 +97,33 @@ class EventController(object):
     @util.identified_stack
     def index(self, req, identity, resource_name=None):
         """
-        Lists summary information for all resources
+        Lists summary information for all events
         """
+        whitelist = {
+            'limit': 'single',
+            'marker': 'single',
+            'sort_dir': 'single',
+            'sort_keys': 'multi',
+        }
+        filter_whitelist = {
+            'resource_status': 'mixed',
+            'resource_action': 'mixed',
+            'resource_name': 'mixed',
+            'resource_type': 'mixed',
+        }
+        params = util.get_allowed_params(req.params, whitelist)
+        filter_params = util.get_allowed_params(req.params, filter_whitelist)
+        if not filter_params:
+            filter_params = None
 
         if resource_name is None:
-            events = self._event_list(req, identity)
+            events = self._event_list(req, identity,
+                                      filters=filter_params, **params)
         else:
             res_match = lambda e: e[engine_api.EVENT_RES_NAME] == resource_name
 
-            events = self._event_list(req, identity, res_match)
+            events = self._event_list(req, identity, res_match,
+                                      filters=filter_params, **params)
             if not events:
                 msg = _('No events found for resource %s') % resource_name
                 raise exc.HTTPNotFound(msg)
@@ -108,7 +133,7 @@ class EventController(object):
     @util.identified_stack
     def show(self, req, identity, resource_name, event_id):
         """
-        Gets detailed information for a stack
+        Gets detailed information for an event
         """
 
         def event_match(ev):
@@ -127,7 +152,6 @@ def create_resource(options):
     """
     Events resource factory method.
     """
-    # TODO(zaneb) handle XML based on Content-type/Accepts
     deserializer = wsgi.JSONRequestDeserializer()
-    serializer = wsgi.JSONResponseSerializer()
+    serializer = serializers.JSONResponseSerializer()
     return wsgi.Resource(EventController(options), deserializer, serializer)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,26 +11,26 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from heat.api.aws import exception
+from heat.common import identifier
 from heat.common import wsgi
 from heat.rpc import client as rpc_client
-from heat.common import identifier
-from heat.api.aws import exception
 
 
 class SignalController(object):
     def __init__(self, options):
         self.options = options
-        self.engine = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
 
     def update_waitcondition(self, req, body, arn):
         con = req.context
         identity = identifier.ResourceIdentifier.from_arn(arn)
         try:
-            md = self.engine.metadata_update(
+            md = self.rpc_client.resource_signal(
                 con,
                 stack_identity=dict(identity.stack()),
                 resource_name=identity.resource_name,
-                metadata=body)
+                details=body)
         except Exception as ex:
             return exception.map_remote_error(ex)
 
@@ -42,7 +40,7 @@ class SignalController(object):
         con = req.context
         identity = identifier.ResourceIdentifier.from_arn(arn)
         try:
-            md = self.engine.resource_signal(
+            self.rpc_client.resource_signal(
                 con,
                 stack_identity=dict(identity.stack()),
                 resource_name=identity.resource_name,

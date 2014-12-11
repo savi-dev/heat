@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,10 +11,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
+import glob
 import itertools
+import os.path
+import warnings
 
-from heat.openstack.common import log
+from oslo.config import cfg
+import six
+
+from heat.common import environment_format as env_fmt
 from heat.common import exception
+from heat.common.i18n import _
+from heat.engine import support
+from heat.openstack.common import log
 
 
 LOG = log.getLogger(__name__)
@@ -106,10 +114,12 @@ class TemplateResourceInfo(ResourceInfo):
             self.template_name = self.name
         else:
             self.template_name = value
+        self.value = self.template_name
 
     def get_class(self):
         from heat.engine.resources import template_resource
-        return template_resource.TemplateResource
+        return template_resource.generate_class(str(self.name),
+                                                self.template_name)
 
 
 class MapResourceInfo(ResourceInfo):
@@ -166,7 +176,7 @@ class ResourceRegistry(object):
 
     def _register_info(self, path, info):
         """place the new info in the correct location in the registry.
-        path: a list of keys ['resources', 'my_server', 'OS::Compute::Server']
+        path: a list of keys ['resources', 'my_server', 'OS::Nova::Server']
         """
         descriptive_path = '/'.join(path)
         name = path[-1]
@@ -192,10 +202,12 @@ class ResourceRegistry(object):
                 LOG.warn(_('Removing %(item)s from %(path)s') % {
                     'item': name,
                     'path': descriptive_path})
-                del registry[name]
+                registry.pop(name, None)
             return
 
         if name in registry and isinstance(registry[name], ResourceInfo):
+            if registry[name] == info:
+                return
             details = {
                 'path': descriptive_path,
                 'was': str(registry[name].value),
@@ -205,11 +217,19 @@ class ResourceRegistry(object):
             LOG.info(_('Registering %(path)s -> %(value)s') % {
                 'path': descriptive_path,
                 'value': str(info.value)})
+
+        if isinstance(info, ClassResourceInfo):
+            if info.value.support_status.status != support.SUPPORTED:
+                warnings.warn(six.text_type(info.value.support_status.message))
+
         info.user_resource = (self.global_registry is not None)
         registry[name] = info
 
     def iterable_by(self, resource_type, resource_name=None):
-        if resource_type.endswith(('.yaml', '.template')):
+        is_templ_type = resource_type.endswith(('.yaml', '.template'))
+        if self.global_registry is not None and is_templ_type:
+            # we only support dynamic resource types in user environments
+            # not the global environment.
             # resource with a Type == a template
             # we dynamically create an entry as it has not been registered.
             if resource_type not in self._registry:
@@ -223,7 +243,7 @@ class ResourceRegistry(object):
             if impl and resource_type in impl:
                 yield impl[resource_type]
 
-        # handle: "OS::Compute::Server" -> "Rackspace::Compute::Server"
+        # handle: "OS::Nova::Server" -> "Rackspace::Cloud::Server"
         impl = self._registry.get(resource_type)
         if impl:
             yield impl
@@ -232,12 +252,12 @@ class ResourceRegistry(object):
         def is_a_glob(resource_type):
             return resource_type.endswith('*')
         globs = itertools.ifilter(is_a_glob, self._registry.keys())
-        for glob in globs:
-            if self._registry[glob].matches(resource_type):
-                yield self._registry[glob]
+        for pattern in globs:
+            if self._registry[pattern].matches(resource_type):
+                yield self._registry[pattern]
 
     def get_resource_info(self, resource_type, resource_name=None,
-                          registry_type=None):
+                          registry_type=None, accept_fn=None):
         """Find possible matches to the resource type and name.
         chain the results from the global and user registry to find
         a match.
@@ -268,14 +288,27 @@ class ResourceRegistry(object):
         for info in sorted(matches):
             match = info.get_resource_info(resource_type,
                                            resource_name)
-            if registry_type is None or isinstance(match, registry_type):
+            if ((registry_type is None or isinstance(match, registry_type)) and
+                    (accept_fn is None or accept_fn(info))):
                 return match
 
-    def get_class(self, resource_type, resource_name=None):
+    def get_class(self, resource_type, resource_name=None, accept_fn=None):
+        if resource_type == "":
+            msg = _('Resource "%s" has no type') % resource_name
+            raise exception.StackValidationFailed(message=msg)
+        elif resource_type is None:
+            msg = _('Non-empty resource type is required '
+                    'for resource "%s"') % resource_name
+            raise exception.StackValidationFailed(message=msg)
+        elif not isinstance(resource_type, basestring):
+            msg = _('Resource "%s" type is not a string') % resource_name
+            raise exception.StackValidationFailed(message=msg)
+
         info = self.get_resource_info(resource_type,
-                                      resource_name=resource_name)
+                                      resource_name=resource_name,
+                                      accept_fn=accept_fn)
         if info is None:
-            msg = "Unknown resource Type : %s" % resource_type
+            msg = _("Unknown resource Type : %s") % resource_type
             raise exception.StackValidationFailed(message=msg)
         return info.get_class()
 
@@ -292,23 +325,26 @@ class ResourceRegistry(object):
 
         return _as_dict(self._registry)
 
-    def get_types(self):
+    def get_types(self, support_status):
         '''Return a list of valid resource types.'''
-        def is_plugin(key):
-            if isinstance(self._registry[key], ClassResourceInfo):
-                return True
-            return False
-        return [k for k in self._registry if is_plugin(k)]
 
+        def is_resource(key):
+            return isinstance(self._registry[key], (ClassResourceInfo,
+                                                    TemplateResourceInfo))
 
-SECTIONS = (PARAMETERS, RESOURCE_REGISTRY) = \
-           ('parameters', 'resource_registry')
+        def status_matches(cls):
+            return (support_status is None or
+                    cls.get_class().support_status.status ==
+                    support_status.encode())
+
+        return [name for name, cls in six.iteritems(self._registry)
+                if is_resource(name) and status_matches(cls)]
 
 
 class Environment(object):
 
     def __init__(self, env=None, user_env=True):
-        """Create an Environment from a dict of varing format.
+        """Create an Environment from a dict of varying format.
         1) old-school flat parameters
         2) or newer {resource_registry: bla, parameters: foo}
 
@@ -324,33 +360,91 @@ class Environment(object):
             global_registry = None
 
         self.registry = ResourceRegistry(global_registry)
-        self.registry.load(env.get(RESOURCE_REGISTRY, {}))
+        self.registry.load(env.get(env_fmt.RESOURCE_REGISTRY, {}))
 
-        if 'parameters' in env:
-            self.params = env['parameters']
+        if env_fmt.PARAMETERS in env:
+            self.params = env[env_fmt.PARAMETERS]
         else:
-            self.params = dict((k, v) for (k, v) in env.iteritems()
-                               if k != RESOURCE_REGISTRY)
+            self.params = dict((k, v) for (k, v) in six.iteritems(env)
+                               if k != env_fmt.RESOURCE_REGISTRY)
+        self.constraints = {}
+        self.stack_lifecycle_plugins = []
 
     def load(self, env_snippet):
-        self.registry.load(env_snippet.get(RESOURCE_REGISTRY, {}))
-        self.params.update(env_snippet.get('parameters', {}))
+        self.registry.load(env_snippet.get(env_fmt.RESOURCE_REGISTRY, {}))
+        self.params.update(env_snippet.get(env_fmt.PARAMETERS, {}))
+
+    def patch_previous_parameters(self, previous_env, clear_parameters=[]):
+        """This instance of Environment is the new environment where
+        we are reusing as default the previous parameter values.
+        """
+        previous_parameters = copy.deepcopy(previous_env.params)
+        # clear the parameters from the previous set as requested
+        for p in clear_parameters:
+            previous_parameters.pop(p, None)
+
+        # patch the new set of parameters
+        previous_parameters.update(self.params)
+        self.params = previous_parameters
 
     def user_env_as_dict(self):
         """Get the environment as a dict, ready for storing in the db."""
-        return {RESOURCE_REGISTRY: self.registry.as_dict(),
-                PARAMETERS: self.params}
+        return {env_fmt.RESOURCE_REGISTRY: self.registry.as_dict(),
+                env_fmt.PARAMETERS: self.params}
 
     def register_class(self, resource_type, resource_class):
         self.registry.register_class(resource_type, resource_class)
 
+    def register_constraint(self, constraint_name, constraint):
+        self.constraints[constraint_name] = constraint
+
+    def register_stack_lifecycle_plugin(self, stack_lifecycle_name,
+                                        stack_lifecycle_class):
+        self.stack_lifecycle_plugins.append((stack_lifecycle_name,
+                                             stack_lifecycle_class))
+
     def get_class(self, resource_type, resource_name=None):
         return self.registry.get_class(resource_type, resource_name)
 
-    def get_types(self):
-        return self.registry.get_types()
+    def get_types(self, support_status=None):
+        return self.registry.get_types(support_status)
 
     def get_resource_info(self, resource_type, resource_name=None,
                           registry_type=None):
         return self.registry.get_resource_info(resource_type, resource_name,
                                                registry_type)
+
+    def get_constraint(self, name):
+        return self.constraints.get(name)
+
+    def get_stack_lifecycle_plugins(self):
+        return self.stack_lifecycle_plugins
+
+
+def read_global_environment(env, env_dir=None):
+    if env_dir is None:
+        cfg.CONF.import_opt('environment_dir', 'heat.common.config')
+        env_dir = cfg.CONF.environment_dir
+
+    try:
+        env_files = glob.glob(os.path.join(env_dir, '*'))
+    except OSError as osex:
+        LOG.error(_('Failed to read %s') % env_dir)
+        LOG.exception(osex)
+        return
+
+    for file_path in env_files:
+        try:
+            with open(file_path) as env_fd:
+                LOG.info(_('Loading %s') % file_path)
+                env_body = env_fmt.parse(env_fd.read())
+                env_fmt.default_for_missing(env_body)
+                env.load(env_body)
+        except ValueError as vex:
+            LOG.error(_('Failed to parse %(file_path)s') % {
+                      'file_path': file_path})
+            LOG.exception(vex)
+        except IOError as ioex:
+            LOG.error(_('Failed to read %(file_path)s') % {
+                      'file_path': file_path})
+            LOG.exception(ioex)

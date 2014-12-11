@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 #
@@ -18,16 +17,19 @@
 """Heat exception subclasses"""
 
 import functools
-import urlparse
 import sys
 
+import six
+from six.moves.urllib import parse as urlparse
+
+from heat.openstack.common.gettextutils import _
 from heat.openstack.common import log as logging
 
 
 _FATAL_EXCEPTION_FORMAT_ERRORS = False
 
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 class RedirectException(Exception):
@@ -110,18 +112,21 @@ class HeatException(Exception):
             exc_info = sys.exc_info()
             #kwargs doesn't match a variable in the message
             #log the issue and the kwargs
-            logger.exception(_('Exception in string format operation'))
-            for name, value in kwargs.iteritems():
-                logger.error("%s: %s" % (name, value))
+            LOG.exception(_('Exception in string format operation'))
+            for name, value in six.iteritems(kwargs):
+                LOG.error("%s: %s" % (name, value))  # noqa
 
             if _FATAL_EXCEPTION_FORMAT_ERRORS:
                 raise exc_info[0], exc_info[1], exc_info[2]
 
     def __str__(self):
-        return str(self.message)
+        return unicode(self.message).encode('UTF-8')
 
     def __unicode__(self):
         return unicode(self.message)
+
+    def __deepcopy__(self, memo):
+        return self.__class__(**self.kwargs)
 
 
 class MissingCredentialError(HeatException):
@@ -153,7 +158,7 @@ class Forbidden(HeatException):
     msg_fmt = _("You are not authorized to complete this action.")
 
 
-#NOTE(bcwaldon): here for backwards-compatability, need to deprecate.
+#NOTE(bcwaldon): here for backwards-compatibility, need to deprecate.
 class NotAuthorized(Forbidden):
     msg_fmt = _("You are not authorized to complete this action.")
 
@@ -166,17 +171,8 @@ class AuthorizationRedirect(HeatException):
     msg_fmt = _("Redirecting to %(uri)s for authorization.")
 
 
-class ClientConfigurationError(HeatException):
-    msg_fmt = _("There was an error configuring the client.")
-
-
 class RequestUriTooLong(HeatException):
     msg_fmt = _("The URI was too long.")
-
-
-class ServerError(HeatException):
-    msg_fmt = _("The request returned 500 Internal Server Error"
-                "\n\nThe response body:\n%(body)s")
 
 
 class MaxRedirectsExceeded(HeatException):
@@ -185,10 +181,6 @@ class MaxRedirectsExceeded(HeatException):
 
 class InvalidRedirect(HeatException):
     msg_fmt = _("Received invalid HTTP redirect.")
-
-
-class NoServiceEndpoint(HeatException):
-    msg_fmt = _("Response from Keystone does not contain a Heat endpoint.")
 
 
 class RegionAmbiguity(HeatException):
@@ -203,6 +195,14 @@ class UserParameterMissing(HeatException):
 
 class UnknownUserParameter(HeatException):
     msg_fmt = _("The Parameter (%(key)s) was not defined in template.")
+
+
+class InvalidTemplateVersion(HeatException):
+    msg_fmt = _("The template version is invalid: %(explanation)s")
+
+
+class InvalidTemplateSection(HeatException):
+    msg_fmt = _("The template section is invalid: %(section)s")
 
 
 class InvalidTemplateParameter(HeatException):
@@ -231,8 +231,9 @@ class ImageNotFound(HeatException):
     msg_fmt = _("The Image (%(image_name)s) could not be found.")
 
 
-class NoUniqueImageFound(HeatException):
-    msg_fmt = _("Multiple images were found with name (%(image_name)s).")
+class PhysicalResourceNameAmbiguity(HeatException):
+    msg_fmt = _(
+        "Multiple physical resources were found with name (%(name)s).")
 
 
 class InvalidTenant(HeatException):
@@ -249,6 +250,10 @@ class StackExists(HeatException):
 
 
 class StackValidationFailed(HeatException):
+    msg_fmt = _("%(message)s")
+
+
+class InvalidSchemaError(HeatException):
     msg_fmt = _("%(message)s")
 
 
@@ -284,11 +289,15 @@ class ResourceFailure(HeatException):
         self.action = action
         exc_type = type(exception).__name__
         super(ResourceFailure, self).__init__(exc_type=exc_type,
-                                              message=str(exception))
+                                              message=six.text_type(exception))
 
 
 class NotSupported(HeatException):
     msg_fmt = _("%(feature)s is not supported.")
+
+
+class ResourceActionNotSupported(HeatException):
+    msg_fmt = _("%(action)s is not supported for resource.")
 
 
 class ResourcePropertyConflict(HeatException):
@@ -314,17 +323,21 @@ class EgressRuleNotAllowed(HeatException):
                 "Neutron is used and the 'VpcId' property is set.")
 
 
-class Error(Exception):
-    def __init__(self, message=None):
-        super(Error, self).__init__(message)
+class Error(HeatException):
+    msg_fmt = "%(message)s"
+
+    def __init__(self, msg):
+        super(Error, self).__init__(message=msg)
 
 
-class NotFound(Error):
-    pass
+class NotFound(HeatException):
+    def __init__(self, msg_fmt=_('Not found')):
+        self.msg_fmt = msg_fmt
+        super(NotFound, self).__init__()
 
 
 class InvalidContentType(HeatException):
-    msg_fmt = "Invalid content type %(content_type)s"
+    msg_fmt = _("Invalid content type %(content_type)s")
 
 
 class RequestLimitExceeded(HeatException):
@@ -333,3 +346,18 @@ class RequestLimitExceeded(HeatException):
 
 class StackResourceLimitExceeded(HeatException):
     msg_fmt = _('Maximum resources per stack exceeded.')
+
+
+class ActionInProgress(HeatException):
+    msg_fmt = _("Stack %(stack_name)s already has an action (%(action)s) "
+                "in progress.")
+
+
+class StopActionFailed(HeatException):
+    msg_fmt = _("Failed to stop stack (%(stack_name)s) on other engine "
+                "(%(engine_id)s)")
+
+
+class EventSendFailed(HeatException):
+    msg_fmt = _("Failed to send message to stack (%(stack_name)s) "
+                "on other engine (%(engine_id)s)")

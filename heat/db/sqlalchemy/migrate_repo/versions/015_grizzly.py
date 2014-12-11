@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -154,7 +153,7 @@ def upgrade(migrate_engine):
     for index, table in enumerate(tables):
         try:
             table.create()
-        except:
+        except Exception:
             # If an error occurs, drop all tables created so far to return
             # to the previously existing state.
             meta.drop_all(tables=tables[:index])

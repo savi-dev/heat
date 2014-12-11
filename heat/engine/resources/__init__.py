@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,86 +11,44 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
-import os.path
+from stevedore import extension
 
-from oslo.config import cfg
-
-from heat.common import environment_format
-from heat.openstack.common import log
-from heat.openstack.common.gettextutils import _
+from heat.engine import clients
 from heat.engine import environment
-
-
-LOG = log.getLogger(__name__)
+from heat.engine import plugin_manager
 
 
 def _register_resources(env, type_pairs):
-
     for res_name, res_class in type_pairs:
         env.register_class(res_name, res_class)
 
 
-def _get_module_resources(module):
-    if callable(getattr(module, 'resource_mapping', None)):
-        try:
-            return module.resource_mapping().iteritems()
-        except Exception as ex:
-            LOG.error(_('Failed to load resources from %s') % str(module))
-    else:
-        return []
+def _register_constraints(env, type_pairs):
+    for constraint_name, constraint in type_pairs:
+        env.register_constraint(constraint_name, constraint)
 
 
-def _register_modules(env, modules):
-    import itertools
+def _register_stack_lifecycle_plugins(env, type_pairs):
+    for stack_lifecycle_name, stack_lifecycle_class in type_pairs:
+        env.register_stack_lifecycle_plugin(stack_lifecycle_name,
+                                            stack_lifecycle_class)
 
-    resource_lists = (_get_module_resources(m) for m in modules)
-    _register_resources(env, itertools.chain.from_iterable(resource_lists))
+
+def _get_mapping(namespace):
+    mgr = extension.ExtensionManager(
+        namespace=namespace,
+        invoke_on_load=False,
+        verify_requirements=True)
+    return [[name, mgr[name].plugin] for name in mgr.names()]
 
 
 _environment = None
 
 
 def global_env():
-    global _environment
     if _environment is None:
         initialise()
     return _environment
-
-
-def _list_environment_files(env_dir):
-    try:
-        return os.listdir(env_dir)
-    except OSError as osex:
-        LOG.error('Failed to read %s' % (env_dir))
-        LOG.exception(osex)
-        return []
-
-
-def _load_all(env):
-    _load_global_resources(env)
-    _load_global_environment(env)
-
-
-def _load_global_environment(env, env_dir=None):
-    if env_dir is None:
-        cfg.CONF.import_opt('environment_dir', 'heat.common.config')
-        env_dir = cfg.CONF.environment_dir
-
-    for env_name in _list_environment_files(env_dir):
-        try:
-            file_path = os.path.join(env_dir, env_name)
-            with open(file_path) as env_fd:
-                LOG.info('Loading %s' % file_path)
-                env_body = environment_format.parse(env_fd.read())
-                environment_format.default_for_missing(env_body)
-                env.load(env_body)
-        except ValueError as vex:
-            LOG.error('Failed to parse %s/%s' % (env_dir, env_name))
-            LOG.exception(vex)
-        except IOError as ioex:
-            LOG.error('Failed to read %s/%s' % (env_dir, env_name))
-            LOG.exception(ioex)
 
 
 def initialise():
@@ -100,18 +56,33 @@ def initialise():
     if _environment is not None:
         return
 
-    _environment = environment.Environment({}, user_env=False)
-    _load_all(_environment)
+    clients.initialise()
+
+    global_env = environment.Environment({}, user_env=False)
+    _load_global_environment(global_env)
+    _environment = global_env
+
+
+def _load_global_environment(env):
+    _load_global_resources(env)
+    environment.read_global_environment(env)
 
 
 def _load_global_resources(env):
-    import sys
-    from heat.common import plugin_loader
+    _register_constraints(env, _get_mapping('heat.constraints'))
+    _register_stack_lifecycle_plugins(
+        env,
+        _get_mapping('heat.stack_lifecycle_plugins'))
 
-    # load plugin modules
-    _register_modules(env, plugin_loader.load_modules(sys.modules[__name__]))
+    manager = plugin_manager.PluginManager(__name__)
+    # Sometimes resources should not be available for registration in Heat due
+    # to unsatisfied dependencies. We look first for the function
+    # 'available_resource_mapping', which should return the filtered resources.
+    # If it is not found, we look for the legacy 'resource_mapping'.
+    resource_mapping = plugin_manager.PluginMapping(['available_resource',
+                                                     'resource'])
+    constraint_mapping = plugin_manager.PluginMapping('constraint')
 
-    cfg.CONF.import_opt('plugin_dirs', 'heat.common.config')
-    plugin_pkg = plugin_loader.create_subpackage(cfg.CONF.plugin_dirs,
-                                                 'heat.engine')
-    _register_modules(env, plugin_loader.load_modules(plugin_pkg, True))
+    _register_resources(env, resource_mapping.load_all(manager))
+
+    _register_constraints(env, constraint_mapping.load_all(manager))

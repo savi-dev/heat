@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -16,10 +15,10 @@ from mock import patch
 
 from heat.common import exception
 from heat.common import template_format
-from heat.tests import common
-from heat.tests import utils
 from heat.engine import scheduler
 from heat.engine import watchrule
+from heat.tests import common
+from heat.tests import utils
 
 
 AWS_CloudWatch_Alarm = '''
@@ -43,7 +42,6 @@ class CloudWatchAlarmTest(common.HeatTestCase):
 
     def setUp(self):
         super(CloudWatchAlarmTest, self).setUp()
-        utils.setup_dummy_db()
         self.ctx = utils.dummy_context()
 
     def parse_stack(self):
@@ -51,12 +49,10 @@ class CloudWatchAlarmTest(common.HeatTestCase):
         self.stack = utils.parse_stack(t)
         return self.stack
 
-    @utils.stack_delete_after
     def test_resource_create_good(self):
         s = self.parse_stack()
-        self.assertEqual(None, scheduler.TaskRunner(s['test_me'].create)())
+        self.assertIsNone(scheduler.TaskRunner(s['test_me'].create)())
 
-    @utils.stack_delete_after
     def test_resource_create_failed(self):
         s = self.parse_stack()
         with patch.object(watchrule.WatchRule, 'store') as bad_store:
@@ -64,19 +60,16 @@ class CloudWatchAlarmTest(common.HeatTestCase):
             task_func = scheduler.TaskRunner(s['test_me'].create)
             self.assertRaises(exception.ResourceFailure, task_func)
 
-    @utils.stack_delete_after
     def test_resource_delete_good(self):
         s = self.parse_stack()
-        self.assertEqual(None, scheduler.TaskRunner(s['test_me'].create)())
-        self.assertEqual(None, scheduler.TaskRunner(s['test_me'].delete)())
+        self.assertIsNone(scheduler.TaskRunner(s['test_me'].create)())
+        self.assertIsNone(scheduler.TaskRunner(s['test_me'].delete)())
 
-    @utils.stack_delete_after
-    @utils.wr_delete_after
     def test_resource_delete_notfound(self):
         # if a resource is not found, handle_delete() should not raise
         # an exception.
         s = self.parse_stack()
-        self.assertEqual(None, scheduler.TaskRunner(s['test_me'].create)())
+        self.assertIsNone(scheduler.TaskRunner(s['test_me'].create)())
         res_name = self.stack['test_me'].physical_resource_name()
         self.wr = watchrule.WatchRule.load(self.ctx,
                                            watch_name=res_name)
@@ -84,4 +77,4 @@ class CloudWatchAlarmTest(common.HeatTestCase):
         with patch.object(watchrule.WatchRule, 'destroy') as bad_destroy:
             watch_exc = exception.WatchRuleNotFound(watch_name='test')
             bad_destroy.side_effect = watch_exc
-            self.assertEqual(None, scheduler.TaskRunner(s['test_me'].delete)())
+            self.assertIsNone(scheduler.TaskRunner(s['test_me'].delete)())

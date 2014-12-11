@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,19 +11,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo.utils import importutils
 
-from heat.openstack.common import local
 from heat.common import exception
+from heat.common import policy
 from heat.common import wsgi
-from heat.openstack.common import context
-from heat.openstack.common import importutils
-from heat.openstack.common import uuidutils
 from heat.db import api as db_api
-
-
-def generate_request_id():
-    return 'req-' + uuidutils.generate_uuid()
+from heat.engine import clients
+from heat.openstack.common import context
+from heat.openstack.common import local
+from heat.openstack.common.middleware import request_id
 
 
 class RequestContext(context.RequestContext):
@@ -35,12 +30,11 @@ class RequestContext(context.RequestContext):
     """
 
     def __init__(self, auth_token=None, username=None, password=None,
-                 aws_creds=None, tenant=None,
-                 tenant_id=None, auth_url=None, roles=None, is_admin=False,
+                 aws_creds=None, tenant=None, user_id=None,
+                 tenant_id=None, auth_url=None, roles=None, is_admin=None,
                  read_only=False, show_deleted=False,
-                 owner_is_tenant=True, overwrite=True,
-                 trust_id=None, trustor_user_id=None,
-                 request_id=None, **kwargs):
+                 overwrite=True, trust_id=None, trustor_user_id=None,
+                 request_id=None, auth_token_info=None, **kwargs):
         """
         :param overwrite: Set to False to ensure that the greenthread local
             copy of the index is not overwritten.
@@ -56,17 +50,25 @@ class RequestContext(context.RequestContext):
                                              request_id=request_id)
 
         self.username = username
+        self.user_id = user_id
         self.password = password
         self.aws_creds = aws_creds
         self.tenant_id = tenant_id
+        self.auth_token_info = auth_token_info
         self.auth_url = auth_url
         self.roles = roles or []
-        self.owner_is_tenant = owner_is_tenant
         if overwrite or not hasattr(local.store, 'context'):
             self.update_store()
         self._session = None
+        self._clients = None
         self.trust_id = trust_id
         self.trustor_user_id = trustor_user_id
+        self.policy = policy.Enforcer()
+
+        if is_admin is None:
+            self.is_admin = self.policy.check_is_admin(self)
+        else:
+            self.is_admin = is_admin
 
     def update_store(self):
         local.store.context = self
@@ -77,43 +79,42 @@ class RequestContext(context.RequestContext):
             self._session = db_api.get_session()
         return self._session
 
+    @property
+    def clients(self):
+        if self._clients is None:
+            self._clients = clients.Clients(self)
+        return self._clients
+
     def to_dict(self):
         return {'auth_token': self.auth_token,
                 'username': self.username,
+                'user_id': self.user_id,
                 'password': self.password,
                 'aws_creds': self.aws_creds,
                 'tenant': self.tenant,
                 'tenant_id': self.tenant_id,
                 'trust_id': self.trust_id,
                 'trustor_user_id': self.trustor_user_id,
+                'auth_token_info': self.auth_token_info,
                 'auth_url': self.auth_url,
                 'roles': self.roles,
                 'is_admin': self.is_admin,
                 'user': self.user,
-                'request_id': self.request_id}
+                'request_id': self.request_id,
+                'show_deleted': self.show_deleted}
 
     @classmethod
     def from_dict(cls, values):
         return cls(**values)
 
-    @property
-    def owner(self):
-        """Return the owner to correlate with an image."""
-        return self.tenant if self.owner_is_tenant else self.user
 
-
-def get_admin_context(read_deleted="no"):
-    return RequestContext(is_admin=True)
+def get_admin_context(show_deleted=False):
+    return RequestContext(is_admin=True, show_deleted=show_deleted)
 
 
 class ContextMiddleware(wsgi.Middleware):
 
-    opts = [cfg.BoolOpt('owner_is_tenant', default=True),
-            cfg.StrOpt('admin_role', default='admin')]
-
     def __init__(self, app, conf, **local_conf):
-        cfg.CONF.register_opts(self.opts)
-
         # Determine the context class to use
         self.ctxcls = RequestContext
         if 'context_class' in local_conf:
@@ -125,41 +126,17 @@ class ContextMiddleware(wsgi.Middleware):
         """
         Create a context with the given arguments.
         """
-        kwargs.setdefault('owner_is_tenant', cfg.CONF.owner_is_tenant)
-
         return self.ctxcls(*args, **kwargs)
 
     def process_request(self, req):
         """
         Extract any authentication information in the request and
         construct an appropriate context from it.
-
-        A few scenarios exist:
-
-        1. If X-Auth-Token is passed in, then consult TENANT and ROLE headers
-           to determine permissions.
-
-        2. An X-Auth-Token was passed in, but the Identity-Status is not
-           confirmed. For now, just raising a NotAuthenticated exception.
-
-        3. X-Auth-Token is omitted. If we were using Keystone, then the
-           tokenauth middleware would have rejected the request, so we must be
-           using NoAuth. In that case, assume that is_admin=True.
         """
         headers = req.headers
+        environ = req.environ
 
         try:
-            """
-            This sets the username/password to the admin user because you
-            need this information in order to perform token authentication.
-            The real 'username' is the 'tenant'.
-
-            We should also check here to see if X-Auth-Token is not set and
-            in that case we should assign the user/pass directly as the real
-            username/password and token as None.  'tenant' should still be
-            the username.
-            """
-
             username = None
             password = None
             aws_creds = None
@@ -170,6 +147,7 @@ class ContextMiddleware(wsgi.Middleware):
             elif headers.get('X-Auth-EC2-Creds') is not None:
                 aws_creds = headers.get('X-Auth-EC2-Creds')
 
+            user_id = headers.get('X-User-Id')
             token = headers.get('X-Auth-Token')
             tenant = headers.get('X-Tenant-Name')
             tenant_id = headers.get('X-Tenant-Id')
@@ -177,6 +155,8 @@ class ContextMiddleware(wsgi.Middleware):
             roles = headers.get('X-Roles')
             if roles is not None:
                 roles = roles.split(',')
+            token_info = environ.get('keystone.token_info')
+            req_id = environ.get(request_id.ENV_REQUEST_ID)
 
         except Exception:
             raise exception.NotAuthenticated()
@@ -185,9 +165,12 @@ class ContextMiddleware(wsgi.Middleware):
                                         tenant=tenant, tenant_id=tenant_id,
                                         aws_creds=aws_creds,
                                         username=username,
+                                        user_id=user_id,
                                         password=password,
-                                        auth_url=auth_url, roles=roles,
-                                        is_admin=True)
+                                        auth_url=auth_url,
+                                        roles=roles,
+                                        request_id=req_id,
+                                        auth_token_info=token_info)
 
 
 def ContextMiddleware_filter_factory(global_conf, **local_conf):

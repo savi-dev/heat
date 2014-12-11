@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,67 +11,100 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from heat.engine import clients
-from heat.common import exception
-from heat.openstack.common import log as logging
+from heat.engine import attributes
+from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources.vpc import VPC
 
-logger = logging.getLogger(__name__)
-
 
 class Subnet(resource.Resource):
-    tags_schema = {'Key': {'Type': 'String',
-                           'Required': True},
-                   'Value': {'Type': 'String',
-                             'Required': True}}
+
+    PROPERTIES = (
+        AVAILABILITY_ZONE, CIDR_BLOCK, VPC_ID, TAGS,
+    ) = (
+        'AvailabilityZone', 'CidrBlock', 'VpcId', 'Tags',
+    )
+
+    _TAG_KEYS = (
+        TAG_KEY, TAG_VALUE,
+    ) = (
+        'Key', 'Value',
+    )
+
+    ATTRIBUTES = (
+        AVAILABILITY_ZONE,
+    )
 
     properties_schema = {
-        'AvailabilityZone': {
-            'Type': 'String',
-            'Description': _('Availablity zone in which you want the '
-                             'subnet.')},
-        'CidrBlock': {
-            'Type': 'String',
-            'Required': True,
-            'Description': _('CIDR block to apply to subnet.')},
-        'VpcId': {
-            'Type': 'String',
-            'Required': True,
-            'Description': _('Ref structure that contains the ID of the '
-                             'VPC on which you want to create the subnet.')},
-        'Tags': {'Type': 'List', 'Schema': {
-            'Type': 'Map',
-            'Implemented': False,
-            'Schema': tags_schema,
-            'Description': _('List of tags to attach to this resource.')}}
+        AVAILABILITY_ZONE: properties.Schema(
+            properties.Schema.STRING,
+            _('Availability zone in which you want the subnet.')
+        ),
+        CIDR_BLOCK: properties.Schema(
+            properties.Schema.STRING,
+            _('CIDR block to apply to subnet.'),
+            required=True
+        ),
+        VPC_ID: properties.Schema(
+            properties.Schema.STRING,
+            _('Ref structure that contains the ID of the VPC on which you '
+              'want to create the subnet.'),
+            required=True
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            schema=properties.Schema(
+                properties.Schema.MAP,
+                _('List of tags to attach to this resource.'),
+                schema={
+                    TAG_KEY: properties.Schema(
+                        properties.Schema.STRING,
+                        required=True
+                    ),
+                    TAG_VALUE: properties.Schema(
+                        properties.Schema.STRING,
+                        required=True
+                    ),
+                },
+                implemented=False,
+            )
+        ),
     }
+
+    attributes_schema = {
+        AVAILABILITY_ZONE: attributes.Schema(
+            _('Availability Zone of the subnet.')
+        ),
+    }
+
+    default_client_name = 'neutron'
 
     def handle_create(self):
         client = self.neutron()
         # TODO(sbaker) Verify that this CidrBlock is within the vpc CidrBlock
-        network_id = self.properties.get('VpcId')
+        network_id = self.properties.get(self.VPC_ID)
 
         props = {
             'network_id': network_id,
-            'cidr': self.properties.get('CidrBlock'),
+            'cidr': self.properties.get(self.CIDR_BLOCK),
             'name': self.physical_resource_name(),
             'ip_version': 4
         }
         subnet = client.create_subnet({'subnet': props})['subnet']
+        self.resource_id_set(subnet['id'])
 
         router = VPC.router_for_vpc(self.neutron(), network_id)
         if router:
             client.add_interface_router(
                 router['id'],
                 {'subnet_id': subnet['id']})
-        self.resource_id_set(subnet['id'])
 
     def handle_delete(self):
-        from neutronclient.common.exceptions import NeutronClientException
+        if self.resource_id is None:
+            return
 
         client = self.neutron()
-        network_id = self.properties.get('VpcId')
+        network_id = self.properties.get(self.VPC_ID)
         subnet_id = self.resource_id
 
         try:
@@ -82,26 +113,20 @@ class Subnet(resource.Resource):
                 client.remove_interface_router(
                     router['id'],
                     {'subnet_id': subnet_id})
-        except NeutronClientException as ex:
-            if ex.status_code != 404:
-                raise ex
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
 
         try:
             client.delete_subnet(subnet_id)
-        except NeutronClientException as ex:
-            if ex.status_code != 404:
-                raise ex
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
 
-    def FnGetAtt(self, key):
-        if key == 'AvailabilityZone':
-            return self.properties.get(key, '')
-        raise exception.InvalidTemplateAttribute(resource=self.name, key=key)
+    def _resolve_attribute(self, name):
+        if name == self.AVAILABILITY_ZONE:
+            return self.properties.get(self.AVAILABILITY_ZONE)
 
 
 def resource_mapping():
-    if clients.neutronclient is None:
-        return {}
-
     return {
         'AWS::EC2::Subnet': Subnet,
     }

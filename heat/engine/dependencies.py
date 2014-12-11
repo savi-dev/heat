@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,9 +14,11 @@
 import collections
 import itertools
 
-from heat.common import exception
+import six
+from six.moves import xrange
 
-from heat.openstack.common.gettextutils import _
+from heat.common import exception
+from heat.common.i18n import _
 
 
 class CircularDependencyException(exception.HeatException):
@@ -121,20 +121,22 @@ class Graph(collections.defaultdict):
                 for rqd in node:
                     yield (rqr, rqd)
         return itertools.chain.from_iterable(outgoing_edges(*i)
-                                             for i in self.iteritems())
+                                             for i in six.iteritems(self))
 
     def __delitem__(self, key):
         '''Delete the node given by the specified key from the graph.'''
         node = self[key]
 
         for src in node.required_by():
-            self[src] -= key
+            src_node = self[src]
+            if key in src_node:
+                src_node -= key
 
         return super(Graph, self).__delitem__(key)
 
     def __str__(self):
         '''Convert the graph to a human-readable string.'''
-        pairs = ('%s: %s' % (str(k), str(v)) for k, v in self.iteritems())
+        pairs = ('%s: %s' % (str(k), str(v)) for k, v in six.iteritems(self))
         return '{%s}' % ', '.join(pairs)
 
     @staticmethod
@@ -145,7 +147,7 @@ class Graph(collections.defaultdict):
         This is a destructive operation for the graph.
         '''
         for iteration in xrange(len(graph)):
-            for key, node in graph.iteritems():
+            for key, node in six.iteritems(graph):
                 if not node:
                     yield key
                     del graph[key]
@@ -159,11 +161,12 @@ class Graph(collections.defaultdict):
 class Dependencies(object):
     '''Helper class for calculating a dependency graph.'''
 
-    def __init__(self, edges=[]):
+    def __init__(self, edges=None):
         '''
         Initialise, optionally with a list of edges, in the form of
         (requirer, required) tuples.
         '''
+        edges = edges or []
         self._graph = Graph()
         for e in edges:
             self += e

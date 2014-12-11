@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,35 +12,48 @@
 #    under the License.
 
 import base64
-from Crypto.Cipher import AES
-from os import urandom
 
+from Crypto.Cipher import AES
 from oslo.config import cfg
 
-from heat.openstack.common import log as logging
+from heat.openstack.common.crypto import utils
 
 
 auth_opts = [
     cfg.StrOpt('auth_encryption_key',
                default='notgood but just long enough i think',
-               help="Encryption key used for authentication info in database")
+               help="Encryption key used for authentication info in database.")
 ]
 
 cfg.CONF.register_opts(auth_opts)
 
-logger = logging.getLogger(__name__)
-
 
 def encrypt(auth_info):
     if auth_info is None:
+        return None, None
+    sym = utils.SymmetricCrypto()
+    res = sym.encrypt(cfg.CONF.auth_encryption_key[:32],
+                      auth_info, b64encode=True)
+    return 'oslo_decrypt_v1', res
+
+
+def oslo_decrypt_v1(auth_info):
+    if auth_info is None:
         return None
-    iv = urandom(AES.block_size)
-    cipher = AES.new(cfg.CONF.auth_encryption_key[:32], AES.MODE_CFB, iv)
-    res = base64.b64encode(iv + cipher.encrypt(auth_info))
-    return res
+    sym = utils.SymmetricCrypto()
+    return sym.decrypt(cfg.CONF.auth_encryption_key[:32],
+                       auth_info, b64decode=True)
 
 
-def decrypt(auth_info):
+def heat_decrypt(auth_info):
+    """Decrypt function for data that has been encrypted using an older
+    version of Heat.
+    Note: the encrypt function returns the function that is needed to
+    decrypt the data. The database then stores this. When the data is
+    then retrieved (potentially by a later version of Heat) the decrypt
+    function must still exist. So whilst it may seem that this function
+    is not referenced, it will be referenced from the database.
+    """
     if auth_info is None:
         return None
     auth = base64.b64decode(auth_info)

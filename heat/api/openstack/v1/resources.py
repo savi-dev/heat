@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,13 +14,15 @@
 import itertools
 
 from heat.api.openstack.v1 import util
+from heat.common import identifier
+from heat.common import serializers
 from heat.common import wsgi
 from heat.rpc import api as engine_api
-from heat.common import identifier
 from heat.rpc import client as rpc_client
 
 
-def format_resource(req, res, keys=[]):
+def format_resource(req, res, keys=None):
+    keys = keys or []
     include_key = lambda k: k in keys if keys else True
 
     def transform(key, value):
@@ -31,11 +31,19 @@ def format_resource(req, res, keys=[]):
 
         if key == engine_api.RES_ID:
             identity = identifier.ResourceIdentifier(**value)
-            yield ('links', [util.make_link(req, identity),
-                             util.make_link(req, identity.stack(), 'stack')])
+            links = [util.make_link(req, identity),
+                     util.make_link(req, identity.stack(), 'stack')]
+
+            nested_id = res.get(engine_api.RES_NESTED_STACK_ID)
+            if nested_id:
+                nested_identity = identifier.HeatIdentifier(**nested_id)
+                links.append(util.make_link(req, nested_identity, 'nested'))
+
+            yield ('links', links)
         elif (key == engine_api.RES_STACK_NAME or
               key == engine_api.RES_STACK_ID or
-              key == engine_api.RES_ACTION):
+              key == engine_api.RES_ACTION or
+              key == engine_api.RES_NESTED_STACK_ID):
             return
         elif (key == engine_api.RES_METADATA):
             return
@@ -60,10 +68,12 @@ class ResourceController(object):
     WSGI controller for Resources in Heat v1 API
     Implements the API actions
     """
+    # Define request scope (must match what is in policy.json)
+    REQUEST_SCOPE = 'resource'
 
     def __init__(self, options):
         self.options = options
-        self.engine = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
 
     @util.identified_stack
     def index(self, req, identity):
@@ -71,41 +81,51 @@ class ResourceController(object):
         Lists summary information for all resources
         """
 
-        res_list = self.engine.list_stack_resources(req.context,
-                                                    identity)
+        # Though nested_depth is defaulted in the RPC API, this prevents empty
+        # strings from being passed, thus breaking the code in the engine.
+        nested_depth = int(req.params.get('nested_depth') or 0)
+        res_list = self.rpc_client.list_stack_resources(req.context,
+                                                        identity,
+                                                        nested_depth)
 
         return {'resources': [format_resource(req, res) for res in res_list]}
 
     @util.identified_stack
     def show(self, req, identity, resource_name):
         """
-        Gets detailed information for a stack
+        Gets detailed information for a resource
         """
 
-        res = self.engine.describe_stack_resource(req.context,
-                                                  identity,
-                                                  resource_name)
+        res = self.rpc_client.describe_stack_resource(req.context,
+                                                      identity,
+                                                      resource_name)
 
         return {'resource': format_resource(req, res)}
 
     @util.identified_stack
     def metadata(self, req, identity, resource_name):
         """
-        Gets detailed information for a stack
+        Gets metadata information for a resource
         """
 
-        res = self.engine.describe_stack_resource(req.context,
-                                                  identity,
-                                                  resource_name)
+        res = self.rpc_client.describe_stack_resource(req.context,
+                                                      identity,
+                                                      resource_name)
 
         return {engine_api.RES_METADATA: res[engine_api.RES_METADATA]}
+
+    @util.identified_stack
+    def signal(self, req, identity, resource_name, body=None):
+        self.rpc_client.resource_signal(req.context,
+                                        stack_identity=identity,
+                                        resource_name=resource_name,
+                                        details=body)
 
 
 def create_resource(options):
     """
     Resources resource factory method.
     """
-    # TODO(zaneb) handle XML based on Content-type/Accepts
     deserializer = wsgi.JSONRequestDeserializer()
-    serializer = wsgi.JSONResponseSerializer()
+    serializer = serializers.JSONResponseSerializer()
     return wsgi.Resource(ResourceController(options), deserializer, serializer)

@@ -11,6 +11,8 @@
       License for the specific language governing permissions and limitations
       under the License.
 
+.. _environments:
+
 ============
 Environments
 ============
@@ -19,17 +21,51 @@ The environment is used to affect the runtime behaviour of the
 template. It provides a way to override the default resource
 implementation and the parameters passed to Heat.
 
+To fully understand the runtime behavior you also have to consider
+what plug-ins the cloud provider has installed.
+
 ------
 Format
 ------
-It is a yaml text file with two main sections "resource_registry" and "parameters".
+
+It is a yaml text file with two main sections "resource_registry" and
+"parameters".
 
 ------------------
 Command line usage
 ------------------
 ::
 
-  heat stack-create -e my_env.yaml -P "some_parm=bla" -f my_tmpl.yaml
+   heat stack-create my_stack -e my_env.yaml -P "some_parm=bla" -f my_tmpl.yaml
+
+---------------------------------
+Global and effective environments
+---------------------------------
+
+The environment used for a stack is the combination of (1) the
+environment given by the user with the template for the stack and (2)
+a global environment that is determined by the cloud provider.
+Combination is asymmetric: an entry in the first environment takes
+precedence over an entry in the second.  The OpenStack software
+includes a default global environment, which supplies some resource
+types that are included in the standard documentation.  The cloud
+provider can add additional environment entries.
+
+The cloud provider can add to the global environment
+by putting environment files in a configurable directory wherever
+the heat engine runs.  The configuration variable is named
+"environment_dir" and is found in the "heat.common.config" module (AKA
+the "[DEFAULT]" section) of "/etc/heat/heat.conf".  The default for
+that directory is "/etc/heat/environment.d".  Its contents are
+combined in whatever order the shell delivers them when the heat
+engine starts up, which is the time when these files are read.
+
+If the "my_env.yaml" file from the example above had been put in the
+"environment_dir" then the user's command line could be this:
+
+::
+
+   heat stack-create my_stack -P "some_parm=bla" -f my_tmpl.yaml
 
 --------------
 Usage examples
@@ -45,21 +81,26 @@ Usage examples
     ImageId: F18-x86_64-cfntools
 
 
-2) Deal with the renaming of Quantum to Neutron
+2) Deal with the mapping of Quantum to Neutron
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ::
 
   resource_registry:
     "OS::Quantum*": "OS::Neutron*"
 
+So all existing resources which can be matched with "OS::Neutron*"
+will be mapped to "OS::Quantum*" accordingly.
 
-3) Override a resource type with a custom TemplateResource
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3) Override a resource type with a custom template resource
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ::
 
   resource_registry:
     "AWS::EC2::Instance": file:///home/mine/my_instance_with_better_defaults.yaml
 
+Please note that the template resource URL here must end with ".yaml"
+or ".template", or it will not be treated as a custom template
+resource.
 
 4) Always map resource type X to Y
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

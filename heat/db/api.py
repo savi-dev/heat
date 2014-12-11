@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -27,20 +25,18 @@ supported backend.
 '''
 
 from oslo.config import cfg
-
-from heat.openstack.common.db import api as db_api
-
-db_opts = [
-    cfg.StrOpt('db_backend',
-               default='sqlalchemy',
-               help='The backend to use for db')]
+from oslo.db import api
 
 CONF = cfg.CONF
-CONF.register_opts(db_opts)
+
 
 _BACKEND_MAPPING = {'sqlalchemy': 'heat.db.sqlalchemy.api'}
 
-IMPL = db_api.DBAPI(backend_mapping=_BACKEND_MAPPING)
+IMPL = api.DBAPI.from_config(CONF, backend_mapping=_BACKEND_MAPPING)
+
+
+def get_engine():
+    return IMPL.get_engine()
 
 
 def get_session():
@@ -53,6 +49,14 @@ def raw_template_get(context, template_id):
 
 def raw_template_create(context, values):
     return IMPL.raw_template_create(context, values)
+
+
+def raw_template_update(context, template_id, values):
+    return IMPL.raw_template_update(context, template_id, values)
+
+
+def resource_data_get_all(resource, data=None):
+    return IMPL.resource_data_get_all(resource, data)
 
 
 def resource_data_get(resource, key):
@@ -102,28 +106,40 @@ def resource_get_by_physical_resource_id(context, physical_resource_id):
                                                      physical_resource_id)
 
 
-def stack_get(context, stack_id, admin=False, show_deleted=False):
-    return IMPL.stack_get(context, stack_id, admin, show_deleted=show_deleted)
+def stack_get(context, stack_id, show_deleted=False, tenant_safe=True,
+              eager_load=False):
+    return IMPL.stack_get(context, stack_id, show_deleted=show_deleted,
+                          tenant_safe=tenant_safe,
+                          eager_load=eager_load)
 
 
-def stack_get_by_name(context, stack_name, owner_id=None):
-    return IMPL.stack_get_by_name(context, stack_name, owner_id=owner_id)
+def stack_get_by_name_and_owner_id(context, stack_name, owner_id):
+    return IMPL.stack_get_by_name_and_owner_id(context, stack_name,
+                                               owner_id=owner_id)
 
 
-def stack_get_all(context):
-    return IMPL.stack_get_all(context)
+def stack_get_by_name(context, stack_name):
+    return IMPL.stack_get_by_name(context, stack_name)
+
+
+def stack_get_all(context, limit=None, sort_keys=None, marker=None,
+                  sort_dir=None, filters=None, tenant_safe=True,
+                  show_deleted=False, show_nested=False):
+    return IMPL.stack_get_all(context, limit, sort_keys,
+                              marker, sort_dir, filters, tenant_safe,
+                              show_deleted, show_nested)
 
 
 def stack_get_all_by_owner_id(context, owner_id):
     return IMPL.stack_get_all_by_owner_id(context, owner_id)
 
 
-def stack_get_all_by_tenant(context):
-    return IMPL.stack_get_all_by_tenant(context)
-
-
-def stack_count_all_by_tenant(context):
-    return IMPL.stack_count_all_by_tenant(context)
+def stack_count_all(context, filters=None, tenant_safe=True,
+                    show_deleted=False, show_nested=False):
+    return IMPL.stack_count_all(context, filters=filters,
+                                tenant_safe=tenant_safe,
+                                show_deleted=show_deleted,
+                                show_nested=show_nested)
 
 
 def stack_create(context, values):
@@ -138,8 +154,24 @@ def stack_delete(context, stack_id):
     return IMPL.stack_delete(context, stack_id)
 
 
+def stack_lock_create(stack_id, engine_id):
+    return IMPL.stack_lock_create(stack_id, engine_id)
+
+
+def stack_lock_steal(stack_id, old_engine_id, new_engine_id):
+    return IMPL.stack_lock_steal(stack_id, old_engine_id, new_engine_id)
+
+
+def stack_lock_release(stack_id, engine_id):
+    return IMPL.stack_lock_release(stack_id, engine_id)
+
+
 def user_creds_create(context):
     return IMPL.user_creds_create(context)
+
+
+def user_creds_delete(context, user_creds_id):
+    return IMPL.user_creds_delete(context, user_creds_id)
 
 
 def user_creds_get(context_id):
@@ -154,12 +186,24 @@ def event_get_all(context):
     return IMPL.event_get_all(context)
 
 
-def event_get_all_by_tenant(context):
-    return IMPL.event_get_all_by_tenant(context)
+def event_get_all_by_tenant(context, limit=None, marker=None,
+                            sort_keys=None, sort_dir=None, filters=None):
+    return IMPL.event_get_all_by_tenant(context,
+                                        limit=limit,
+                                        marker=marker,
+                                        sort_keys=sort_keys,
+                                        sort_dir=sort_dir,
+                                        filters=filters)
 
 
-def event_get_all_by_stack(context, stack_id):
-    return IMPL.event_get_all_by_stack(context, stack_id)
+def event_get_all_by_stack(context, stack_id, limit=None, marker=None,
+                           sort_keys=None, sort_dir=None, filters=None):
+    return IMPL.event_get_all_by_stack(context, stack_id,
+                                       limit=limit,
+                                       marker=marker,
+                                       sort_keys=sort_keys,
+                                       sort_dir=sort_dir,
+                                       filters=filters)
 
 
 def event_count_all_by_stack(context, stack_id):
@@ -206,11 +250,63 @@ def watch_data_get_all(context):
     return IMPL.watch_data_get_all(context)
 
 
-def db_sync(version=None):
+def software_config_create(context, values):
+    return IMPL.software_config_create(context, values)
+
+
+def software_config_get(context, config_id):
+    return IMPL.software_config_get(context, config_id)
+
+
+def software_config_delete(context, config_id):
+    return IMPL.software_config_delete(context, config_id)
+
+
+def software_deployment_create(context, values):
+    return IMPL.software_deployment_create(context, values)
+
+
+def software_deployment_get(context, deployment_id):
+    return IMPL.software_deployment_get(context, deployment_id)
+
+
+def software_deployment_get_all(context, server_id=None):
+    return IMPL.software_deployment_get_all(context, server_id)
+
+
+def software_deployment_update(context, deployment_id, values):
+    return IMPL.software_deployment_update(context, deployment_id, values)
+
+
+def software_deployment_delete(context, deployment_id):
+    return IMPL.software_deployment_delete(context, deployment_id)
+
+
+def snapshot_create(context, values):
+    return IMPL.snapshot_create(context, values)
+
+
+def snapshot_get(context, snapshot_id):
+    return IMPL.snapshot_get(context, snapshot_id)
+
+
+def snapshot_update(context, snapshot_id, values):
+    return IMPL.snapshot_update(context, snapshot_id, values)
+
+
+def snapshot_delete(context, snapshot_id):
+    return IMPL.snapshot_delete(context, snapshot_id)
+
+
+def snapshot_get_all(context, stack_id):
+    return IMPL.snapshot_get_all(context, stack_id)
+
+
+def db_sync(engine, version=None):
     """Migrate the database to `version` or the most recent version."""
-    return IMPL.db_sync(version=version)
+    return IMPL.db_sync(engine, version=version)
 
 
-def db_version():
+def db_version(engine):
     """Display the current database version."""
-    return IMPL.db_version()
+    return IMPL.db_version(engine)

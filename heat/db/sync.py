@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -18,13 +16,15 @@ from __future__ import print_function
 
 import sys
 
-from heat.openstack.common import gettextutils
-
-gettextutils.install('heat')
-
 from oslo.config import cfg
-from heat.openstack.common import log as logging
+from oslo import i18n
+
 from heat.db import migration
+from heat.openstack.common import log as logging
+
+# fixme(elynn): Since install() is deprecated, we should remove it in
+# the future
+i18n.install('heat')
 
 LOG = logging.getLogger(__name__)
 

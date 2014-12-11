@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,41 +12,64 @@
 #    under the License.
 
 from heat.common import exception
-from heat.engine import clients
-from heat.openstack.common import log as logging
+from heat.engine import constraints
+from heat.engine import properties
 from heat.engine import resource
 from heat.engine.resources.neutron import neutron
 
-logger = logging.getLogger(__name__)
-
 
 class VPC(resource.Resource):
-    tags_schema = {'Key': {'Type': 'String',
-                           'Required': True},
-                   'Value': {'Type': 'String',
-                             'Required': True}}
+
+    PROPERTIES = (
+        CIDR_BLOCK, INSTANCE_TENANCY, TAGS,
+    ) = (
+        'CidrBlock', 'InstanceTenancy', 'Tags',
+    )
+
+    _TAG_KEYS = (
+        TAG_KEY, TAG_VALUE,
+    ) = (
+        'Key', 'Value',
+    )
 
     properties_schema = {
-        'CidrBlock': {
-            'Type': 'String',
-            'Description': _('CIDR block to apply to the VPC.')},
-        'InstanceTenancy': {
-            'Type': 'String',
-            'AllowedValues': ['default',
-                              'dedicated'],
-            'Default': 'default',
-            'Implemented': False,
-            'Description': _('Allowed tenancy of instances launched in the '
-                             'VPC. default - any tenancy; dedicated - '
-                             'instance will be dedicated, regardless of '
-                             'the tenancy option specified at instance '
-                             'launch.')},
-        'Tags': {'Type': 'List', 'Schema': {
-            'Type': 'Map',
-            'Implemented': False,
-            'Schema': tags_schema,
-            'Description': _('List of tags to attach to the instance.')}}
+        CIDR_BLOCK: properties.Schema(
+            properties.Schema.STRING,
+            _('CIDR block to apply to the VPC.')
+        ),
+        INSTANCE_TENANCY: properties.Schema(
+            properties.Schema.STRING,
+            _('Allowed tenancy of instances launched in the VPC. default - '
+              'any tenancy; dedicated - instance will be dedicated, '
+              'regardless of the tenancy option specified at instance '
+              'launch.'),
+            default='default',
+            constraints=[
+                constraints.AllowedValues(['default', 'dedicated']),
+            ],
+            implemented=False
+        ),
+        TAGS: properties.Schema(
+            properties.Schema.LIST,
+            schema=properties.Schema(
+                properties.Schema.MAP,
+                _('List of tags to attach to the instance.'),
+                schema={
+                    TAG_KEY: properties.Schema(
+                        properties.Schema.STRING,
+                        required=True
+                    ),
+                    TAG_VALUE: properties.Schema(
+                        properties.Schema.STRING,
+                        required=True
+                    ),
+                },
+                implemented=False,
+            )
+        ),
     }
+
+    default_client_name = 'neutron'
 
     def handle_create(self):
         client = self.neutron()
@@ -57,9 +78,8 @@ class VPC(resource.Resource):
         router_props = {'name': self.physical_resource_name()}
 
         net = client.create_network({'network': net_props})['network']
-        client.create_router({'router': router_props})['router']
-
         self.resource_id_set(net['id'])
+        client.create_router({'router': router_props})['router']
 
     @staticmethod
     def network_for_vpc(client, network_id):
@@ -88,26 +108,24 @@ class VPC(resource.Resource):
         return neutron.NeutronResource.is_built(router)
 
     def handle_delete(self):
-        from neutronclient.common.exceptions import NeutronClientException
+        if self.resource_id is None:
+            return
         client = self.neutron()
-        router = self.router_for_vpc(client, self.resource_id)
+
         try:
-            client.delete_router(router['id'])
-        except NeutronClientException as ex:
-            if ex.status_code != 404:
-                raise ex
+            router = self.router_for_vpc(client, self.resource_id)
+            if router:
+                client.delete_router(router['id'])
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
 
         try:
             client.delete_network(self.resource_id)
-        except NeutronClientException as ex:
-            if ex.status_code != 404:
-                raise ex
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
 
 
 def resource_mapping():
-    if clients.neutronclient is None:
-        return {}
-
     return {
         'AWS::EC2::VPC': VPC,
     }

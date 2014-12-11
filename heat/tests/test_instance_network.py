@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,18 +11,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
+import uuid
 
+from heat.common import template_format
+from heat.engine.clients.os import glance
+from heat.engine.clients.os import neutron
+from heat.engine.clients.os import nova
 from heat.engine import environment
-from heat.tests.v1_1 import fakes
+from heat.engine import parser
 from heat.engine.resources import instance as instances
 from heat.engine.resources import network_interface as network_interfaces
-from heat.engine.resources import nova_utils
-from heat.common import template_format
-from heat.engine import parser
 from heat.engine import scheduler
-from heat.openstack.common import uuidutils
 from heat.tests.common import HeatTestCase
 from heat.tests import utils
+from heat.tests.v1_1 import fakes
 
 
 wp_template = '''
@@ -143,12 +145,55 @@ class FakeNeutron(object):
                 'tenant_id': 'c1210485b2424d48804aad5d39c61b8f'
             }}
 
+    def delete_port(self, port_id):
+        return None
+
 
 class instancesTest(HeatTestCase):
     def setUp(self):
         super(instancesTest, self).setUp()
         self.fc = fakes.FakeClient()
-        utils.setup_dummy_db()
+
+    def _mock_get_image_id_success(self, imageId_input, imageId):
+        self.m.StubOutWithMock(glance.GlanceClientPlugin, 'get_image_id')
+        glance.GlanceClientPlugin.get_image_id(
+            imageId_input).MultipleTimes().AndReturn(imageId)
+
+    def _test_instance_create_delete(self, vm_status='ACTIVE',
+                                     vm_delete_status='NotFound'):
+        return_server = self.fc.servers.list()[1]
+        instance = self._create_test_instance(return_server, 'in_create')
+
+        instance.resource_id = '1234'
+        instance.status = vm_status
+        # this makes sure the auto increment worked on instance creation
+        self.assertTrue(instance.id > 0)
+
+        expected_ip = return_server.networks['public'][0]
+        self.assertEqual(expected_ip, instance.FnGetAtt('PublicIp'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PrivateIp'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PrivateDnsName'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PublicDnsName'))
+
+        d1 = {'server': self.fc.client.get_servers_detail()[1]['servers'][0]}
+        d1['server']['status'] = vm_status
+
+        self.m.StubOutWithMock(self.fc.client, 'get_servers_1234')
+        get = self.fc.client.get_servers_1234
+        get().AndReturn((200, d1))
+
+        d2 = copy.deepcopy(d1)
+        if vm_delete_status == 'DELETED':
+            d2['server']['status'] = vm_delete_status
+            get().AndReturn((200, d2))
+        else:
+            get().AndRaise(fakes.fake_exception())
+
+        self.m.ReplayAll()
+
+        scheduler.TaskRunner(instance.delete)()
+        self.assertEqual((instance.DELETE, instance.COMPLETE), instance.state)
+        self.m.VerifyAll()
 
     def _create_test_instance(self, return_server, name):
         stack_name = '%s_s' % name
@@ -159,25 +204,37 @@ class instancesTest(HeatTestCase):
                   'SubnetId': '4156c7a5-e8c4-4aff-a6e1-8f3c7bc83861'}
         stack = parser.Stack(utils.dummy_context(), stack_name, template,
                              environment.Environment(kwargs),
-                             stack_id=uuidutils.generate_uuid())
-
-        t['Resources']['WebServer']['Properties']['ImageId'] = 'CentOS 5.2'
+                             stack_id=str(uuid.uuid4()))
+        image_id = 'CentOS 5.2'
+        t['Resources']['WebServer']['Properties']['ImageId'] = image_id
+        resource_defns = stack.t.resource_definitions(stack)
         instance = instances.Instance('%s_name' % name,
-                                      t['Resources']['WebServer'], stack)
+                                      resource_defns['WebServer'], stack)
+        metadata = instance.metadata_get()
 
-        self.m.StubOutWithMock(instance, 'nova')
-        instance.nova().MultipleTimes().AndReturn(self.fc)
+        self.m.StubOutWithMock(nova.NovaClientPlugin, '_create')
+        nova.NovaClientPlugin._create().AndReturn(self.fc)
+
+        self._mock_get_image_id_success(image_id, 1)
 
         self.m.StubOutWithMock(instance, 'neutron')
         instance.neutron().MultipleTimes().AndReturn(FakeNeutron())
 
-        instance.t = instance.stack.resolve_runtime_data(instance.t)
+        self.m.StubOutWithMock(neutron.NeutronClientPlugin, '_create')
+        neutron.NeutronClientPlugin._create().MultipleTimes().AndReturn(
+            FakeNeutron())
 
         # need to resolve the template functions
-        server_userdata = nova_utils.build_userdata(
-            instance,
-            instance.t['Properties']['UserData'])
-        instance.mime_string = server_userdata
+        server_userdata = instance.client_plugin().build_userdata(
+            metadata,
+            instance.t['Properties']['UserData'],
+            'ec2-user')
+        self.m.StubOutWithMock(nova.NovaClientPlugin, 'build_userdata')
+        nova.NovaClientPlugin.build_userdata(
+            metadata,
+            instance.t['Properties']['UserData'],
+            'ec2-user').AndReturn(server_userdata)
+
         self.m.StubOutWithMock(self.fc.servers, 'create')
         self.fc.servers.create(
             image=1, flavor=3, key_name='test',
@@ -185,7 +242,8 @@ class instancesTest(HeatTestCase):
             security_groups=None,
             userdata=server_userdata, scheduler_hints=None, meta=None,
             nics=[{'port-id': '64d913c1-bcb1-42d2-8f0a-9593dbcaf251'}],
-            availability_zone=None).AndReturn(
+            availability_zone=None,
+            block_device_mapping=None).AndReturn(
                 return_server)
         self.m.ReplayAll()
 
@@ -201,31 +259,41 @@ class instancesTest(HeatTestCase):
                   'SubnetId': '4156c7a5-e8c4-4aff-a6e1-8f3c7bc83861'}
         stack = parser.Stack(utils.dummy_context(), stack_name, template,
                              environment.Environment(kwargs),
-                             stack_id=uuidutils.generate_uuid())
+                             stack_id=str(uuid.uuid4()))
+        image_id = 'CentOS 5.2'
+        t['Resources']['WebServer']['Properties']['ImageId'] = image_id
 
-        t['Resources']['WebServer']['Properties']['ImageId'] = 'CentOS 5.2'
-
+        resource_defns = stack.t.resource_definitions(stack)
         nic = network_interfaces.NetworkInterface('%s_nic' % name,
-                                                  t['Resources']['nic1'],
+                                                  resource_defns['nic1'],
                                                   stack)
 
         instance = instances.Instance('%s_name' % name,
-                                      t['Resources']['WebServer'], stack)
+                                      resource_defns['WebServer'], stack)
+        metadata = instance.metadata_get()
 
+        self._mock_get_image_id_success(image_id, 1)
         self.m.StubOutWithMock(nic, 'neutron')
         nic.neutron().MultipleTimes().AndReturn(FakeNeutron())
 
-        self.m.StubOutWithMock(instance, 'nova')
-        instance.nova().MultipleTimes().AndReturn(self.fc)
+        self.m.StubOutWithMock(neutron.NeutronClientPlugin, '_create')
+        neutron.NeutronClientPlugin._create().MultipleTimes().AndReturn(
+            FakeNeutron())
 
-        nic.t = nic.stack.resolve_runtime_data(nic.t)
-        instance.t = instance.stack.resolve_runtime_data(instance.t)
+        self.m.StubOutWithMock(nova.NovaClientPlugin, '_create')
+        nova.NovaClientPlugin._create().AndReturn(self.fc)
 
         # need to resolve the template functions
-        server_userdata = nova_utils.build_userdata(
-            instance,
-            instance.t['Properties']['UserData'])
-        instance.mime_string = server_userdata
+        server_userdata = instance.client_plugin().build_userdata(
+            metadata,
+            instance.t['Properties']['UserData'],
+            'ec2-user')
+        self.m.StubOutWithMock(nova.NovaClientPlugin, 'build_userdata')
+        nova.NovaClientPlugin.build_userdata(
+            metadata,
+            instance.t['Properties']['UserData'],
+            'ec2-user').AndReturn(server_userdata)
+
         self.m.StubOutWithMock(self.fc.servers, 'create')
         self.fc.servers.create(
             image=1, flavor=3, key_name='test',
@@ -233,31 +301,20 @@ class instancesTest(HeatTestCase):
             security_groups=None,
             userdata=server_userdata, scheduler_hints=None, meta=None,
             nics=[{'port-id': '64d913c1-bcb1-42d2-8f0a-9593dbcaf251'}],
-            availability_zone=None).AndReturn(
+            availability_zone=None,
+            block_device_mapping=None).AndReturn(
                 return_server)
         self.m.ReplayAll()
 
         # create network interface
         scheduler.TaskRunner(nic.create)()
-        stack["nic1"] = nic
+        stack.resources["nic1"] = nic
 
         scheduler.TaskRunner(instance.create)()
         return instance
 
-    def test_instance_create(self):
-        return_server = self.fc.servers.list()[1]
-        instance = self._create_test_instance(return_server,
-                                              'in_create')
-        # this makes sure the auto increment worked on instance creation
-        self.assertTrue(instance.id > 0)
-
-        expected_ip = return_server.networks['public'][0]
-        self.assertEqual(instance.FnGetAtt('PublicIp'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateIp'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateDnsName'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateDnsName'), expected_ip)
-
-        self.m.VerifyAll()
+    def test_instance_create_delete_with_SubnetId(self):
+        self._test_instance_create_delete(vm_delete_status='DELETED')
 
     def test_instance_create_with_nic(self):
         return_server = self.fc.servers.list()[1]
@@ -268,9 +325,9 @@ class instancesTest(HeatTestCase):
         self.assertTrue(instance.id > 0)
 
         expected_ip = return_server.networks['public'][0]
-        self.assertEqual(instance.FnGetAtt('PublicIp'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateIp'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateDnsName'), expected_ip)
-        self.assertEqual(instance.FnGetAtt('PrivateDnsName'), expected_ip)
+        self.assertEqual(expected_ip, instance.FnGetAtt('PublicIp'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PrivateIp'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PrivateDnsName'))
+        self.assertEqual(expected_ip, instance.FnGetAtt('PublicDnsName'))
 
         self.m.VerifyAll()

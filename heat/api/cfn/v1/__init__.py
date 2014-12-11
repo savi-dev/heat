@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,15 +12,11 @@
 #    under the License.
 
 import routes
-
 from webob import Request
 
-from heat.api.cfn.v1 import stacks
 from heat.api.cfn.v1 import signal
+from heat.api.cfn.v1 import stacks
 from heat.common import wsgi
-from heat.openstack.common import log as logging
-
-logger = logging.getLogger(__name__)
 
 
 class API(wsgi.Router):
@@ -37,6 +31,7 @@ class API(wsgi.Router):
         'describe': 'DescribeStacks',
         'delete': 'DeleteStack',
         'update': 'UpdateStack',
+        'cancel_update': 'CancelUpdateStack',
         'events_list': 'DescribeStackEvents',
         'validate_template': 'ValidateTemplate',
         'get_template': 'GetTemplate',

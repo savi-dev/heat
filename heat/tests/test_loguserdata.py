@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -113,7 +112,7 @@ class LoguserdataTest(HeatTestCase):
                 OSError(errno.ENOEXEC, "empty script"))
 
         self.m.ReplayAll()
-        self.assertEqual(None, loguserdata.main())
+        self.assertIsNone(loguserdata.main())
 
         self.m.VerifyAll()
 

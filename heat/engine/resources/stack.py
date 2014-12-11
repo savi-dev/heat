@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -18,17 +16,9 @@ from requests import exceptions
 from heat.common import exception
 from heat.common import template_format
 from heat.common import urlfetch
-from heat.engine.properties import Properties
+from heat.engine import attributes
+from heat.engine import properties
 from heat.engine import stack_resource
-
-from heat.openstack.common import log as logging
-
-logger = logging.getLogger(__name__)
-
-
-(PROP_TEMPLATE_URL,
- PROP_TIMEOUT_MINS,
- PROP_PARAMETERS) = ('TemplateURL', 'TimeoutInMinutes', 'Parameters')
 
 
 class NestedStack(stack_resource.StackResource):
@@ -36,69 +26,91 @@ class NestedStack(stack_resource.StackResource):
     A Resource representing a child stack to allow composition of templates.
     '''
 
-    properties_schema = {
-        PROP_TEMPLATE_URL: {
-            'Type': 'String',
-            'Required': True,
-            'UpdateAllowed': True,
-            'Description': _('The URL of a template that specifies the stack'
-                             ' to be created as a resource.')},
-        PROP_TIMEOUT_MINS: {
-            'Type': 'Number',
-            'UpdateAllowed': True,
-            'Description': _('The length of time, in minutes, to wait for the'
-                             ' nested stack creation.')},
-        PROP_PARAMETERS: {
-            'Type': 'Map',
-            'UpdateAllowed': True,
-            'Description': _('The set of parameters passed to this nested'
-                             ' stack.')}}
+    PROPERTIES = (
+        TEMPLATE_URL, TIMEOUT_IN_MINS, PARAMETERS,
+    ) = (
+        'TemplateURL', 'TimeoutInMinutes', 'Parameters',
+    )
 
-    update_allowed_keys = ('Properties',)
+    properties_schema = {
+        TEMPLATE_URL: properties.Schema(
+            properties.Schema.STRING,
+            _('The URL of a template that specifies the stack to be created '
+              'as a resource.'),
+            required=True,
+            update_allowed=True
+        ),
+        TIMEOUT_IN_MINS: properties.Schema(
+            properties.Schema.NUMBER,
+            _('The length of time, in minutes, to wait for the nested stack '
+              'creation.'),
+            update_allowed=True
+        ),
+        PARAMETERS: properties.Schema(
+            properties.Schema.MAP,
+            _('The set of parameters passed to this nested stack.'),
+            update_allowed=True
+        ),
+    }
+
+    def child_template(self):
+        try:
+            template_data = urlfetch.get(self.properties[self.TEMPLATE_URL])
+        except (exceptions.RequestException, IOError) as r_exc:
+            raise ValueError(_("Could not fetch remote template '%(url)s': "
+                             "%(exc)s") %
+                             {'url': self.properties[self.TEMPLATE_URL],
+                              'exc': str(r_exc)})
+
+        return template_format.parse(template_data)
+
+    def child_params(self):
+        return self.properties[self.PARAMETERS]
+
+    def handle_adopt(self, resource_data=None):
+        return self._create_with_template(resource_adopt_data=resource_data)
 
     def handle_create(self):
-        try:
-            template_data = urlfetch.get(self.properties[PROP_TEMPLATE_URL])
-        except (exceptions.RequestException, IOError) as r_exc:
-            raise ValueError("Could not fetch remote template '%s': %s" %
-                             (self.properties[PROP_TEMPLATE_URL], str(r_exc)))
+        return self._create_with_template()
 
-        template = template_format.parse(template_data)
-
+    def _create_with_template(self, resource_adopt_data=None):
+        template = self.child_template()
         return self.create_with_template(template,
-                                         self.properties[PROP_PARAMETERS],
-                                         self.properties[PROP_TIMEOUT_MINS])
+                                         self.child_params(),
+                                         self.properties[self.TIMEOUT_IN_MINS],
+                                         adopt_data=resource_adopt_data)
 
     def handle_delete(self):
         return self.delete_nested()
 
-    def FnGetAtt(self, key):
+    def FnGetAtt(self, key, *path):
         if key and not key.startswith('Outputs.'):
             raise exception.InvalidTemplateAttribute(resource=self.name,
                                                      key=key)
-        return self.get_output(key.partition('.')[-1])
+        attribute = self.get_output(key.partition('.')[-1])
+        return attributes.select_from_attribute(attribute, path)
 
     def FnGetRefId(self):
         return self.nested().identifier().arn()
 
     def handle_update(self, json_snippet, tmpl_diff, prop_diff):
         # Nested stack template may be changed even if the prop_diff is empty.
-        self.properties = Properties(self.properties_schema,
-                                     json_snippet.get('Properties', {}),
-                                     self.stack.resolve_runtime_data,
-                                     self.name)
+        self.properties = json_snippet.properties(self.properties_schema,
+                                                  self.context)
 
         try:
-            template_data = urlfetch.get(self.properties[PROP_TEMPLATE_URL])
+            template_data = urlfetch.get(self.properties[self.TEMPLATE_URL])
         except (exceptions.RequestException, IOError) as r_exc:
-            raise ValueError("Could not fetch remote template '%s': %s" %
-                             (self.properties[PROP_TEMPLATE_URL], str(r_exc)))
+            raise ValueError(_("Could not fetch remote template '%(url)s': "
+                             "%(exc)s") %
+                             {'url': self.properties[self.TEMPLATE_URL],
+                              'exc': str(r_exc)})
 
         template = template_format.parse(template_data)
 
         return self.update_with_template(template,
-                                         self.properties[PROP_PARAMETERS],
-                                         self.properties[PROP_TIMEOUT_MINS])
+                                         self.properties[self.PARAMETERS],
+                                         self.properties[self.TIMEOUT_IN_MINS])
 
 
 def resource_mapping():

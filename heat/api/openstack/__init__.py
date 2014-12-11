@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,8 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from heat.api.middleware.version_negotiation import VersionNegotiationFilter
 from heat.api.middleware.fault import FaultWrapper
+from heat.api.middleware.ssl import SSLMiddleware
+from heat.api.middleware.version_negotiation import VersionNegotiationFilter
 from heat.api.openstack import versions
 
 
@@ -25,3 +24,7 @@ def version_negotiation_filter(app, conf, **local_conf):
 
 def faultwrap_filter(app, conf, **local_conf):
     return FaultWrapper(app)
+
+
+def sslmiddleware_filter(app, conf, **local_conf):
+    return SSLMiddleware(app)

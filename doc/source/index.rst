@@ -52,6 +52,21 @@ Developers Documentation
    :maxdepth: 1
 
    architecture
+   pluginguide
+
+API Documentation
+========================
+
+-  `Heat REST API Reference (OpenStack API Complete Reference - Orchestration)`_
+
+   .. _`Heat REST API Reference (OpenStack API Complete Reference - Orchestration)`: http://api.openstack.org/api-ref-orchestration-v1.html
+
+Operations Documentation
+========================
+.. toctree::
+   :maxdepth: 1
+
+   scale_deployment
 
 Code Documentation
 ==================

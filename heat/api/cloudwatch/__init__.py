@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,22 +12,18 @@
 #    under the License.
 
 import routes
+from webob import Request
 
-from heat.openstack.common import gettextutils
+from oslo import i18n
 
-gettextutils.install('heat')
-
+from heat.api.cloudwatch import versions
 from heat.api.cloudwatch import watch
+from heat.api.middleware.version_negotiation import VersionNegotiationFilter
 from heat.common import wsgi
 
-from webob import Request
-from heat.api.middleware.version_negotiation import VersionNegotiationFilter
-from heat.api.cloudwatch import versions
-
-
-from heat.openstack.common import log as logging
-
-logger = logging.getLogger(__name__)
+# FIXME(elynn): Since install() is deprecated, we should remove it in the
+# future.
+i18n.install('heat')
 
 
 class API(wsgi.Router):

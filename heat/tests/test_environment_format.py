@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -13,14 +12,10 @@
 #    under the License.
 
 import mock
-import testscenarios
 import yaml
 
 from heat.common import environment_format
 from heat.tests import common
-
-
-load_tests = testscenarios.load_tests_apply_scenarios
 
 
 class YamlEnvironmentTest(common.HeatTestCase):
@@ -48,6 +43,21 @@ resource_regis: {}
 parameters: }
 '''
         self.assertRaises(ValueError, environment_format.parse, env)
+
+    def test_yaml_none(self):
+        self.assertEqual({}, environment_format.parse(None))
+
+    def test_parse_string_environment(self):
+        env = 'just string'
+        expect = 'The environment is not a valid YAML mapping data type.'
+        msg = self.assertRaises(ValueError, environment_format.parse, env)
+        self.assertIn(expect, msg)
+
+    def test_parse_document(self):
+        env = '["foo" , "bar"]'
+        expect = 'The environment is not a valid YAML mapping data type.'
+        msg = self.assertRaises(ValueError, environment_format.parse, env)
+        self.assertIn(expect, msg)
 
 
 class YamlParseExceptions(common.HeatTestCase):

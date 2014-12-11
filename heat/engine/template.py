@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,18 +11,76 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import abc
 import collections
-import json
+import copy
+import functools
+import six
+from stevedore import extension
 
-from heat.api.aws import utils as aws_utils
-from heat.db import api as db_api
 from heat.common import exception
-from heat.engine.parameters import ParamSchema
+from heat.db import api as db_api
+from heat.openstack.common import log as logging
 
-SECTIONS = (VERSION, DESCRIPTION, MAPPINGS,
-            PARAMETERS, RESOURCES, OUTPUTS) = \
-           ('AWSTemplateFormatVersion', 'Description', 'Mappings',
-            'Parameters', 'Resources', 'Outputs')
+LOG = logging.getLogger(__name__)
+
+__all__ = ['Template']
+
+
+_template_classes = None
+
+
+def get_version(template_data, available_versions):
+    version_keys = set(key for key, version in available_versions)
+    candidate_keys = set(k for k, v in six.iteritems(template_data) if
+                         isinstance(v, basestring))
+
+    keys_present = version_keys & candidate_keys
+
+    if len(keys_present) > 1:
+        explanation = _('Ambiguous versions (%s)') % ', '.join(keys_present)
+        raise exception.InvalidTemplateVersion(explanation=explanation)
+    try:
+        version_key = keys_present.pop()
+    except KeyError:
+        explanation = _('Template version was not provided')
+        raise exception.InvalidTemplateVersion(explanation=explanation)
+    return version_key, template_data[version_key]
+
+
+def _get_template_extension_manager():
+    return extension.ExtensionManager(
+        namespace='heat.templates',
+        invoke_on_load=False,
+        verify_requirements=True)
+
+
+def get_template_class(template_data):
+    global _template_classes
+
+    if _template_classes is None:
+        mgr = _get_template_extension_manager()
+        _template_classes = dict((tuple(name.split('.')), mgr[name].plugin)
+                                 for name in mgr.names())
+
+    available_versions = _template_classes.keys()
+    version = get_version(template_data, available_versions)
+    version_type = version[0]
+    try:
+        return _template_classes[version]
+    except KeyError:
+        av_list = [v for k, v in available_versions if k == version_type]
+        msg_data = {'version': ': '.join(version),
+                    'version_type': version_type,
+                    'available': ', '.join(v for v in av_list)}
+
+        if len(av_list) > 1:
+            explanation = _('"%(version)s". "%(version_type)s" '
+                            'should be one of: %(available)s') % msg_data
+        else:
+            explanation = _('"%(version)s". "%(version_type)s" '
+                            'should be: %(available)s') % msg_data
+        raise exception.InvalidTemplateVersion(explanation=explanation)
 
 
 class Template(collections.Mapping):
@@ -33,14 +89,12 @@ class Template(collections.Mapping):
     def __new__(cls, template, *args, **kwargs):
         '''Create a new Template of the appropriate class.'''
 
-        if cls == Template:
-            if 'heat_template_version' in template:
-                # deferred import of HOT module to avoid circular dependency
-                # at load time
-                from heat.engine import hot
-                return hot.HOTemplate(template, *args, **kwargs)
+        if cls != Template:
+            TemplateClass = cls
+        else:
+            TemplateClass = get_template_class(template)
 
-        return super(Template, cls).__new__(cls)
+        return super(Template, cls).__new__(TemplateClass)
 
     def __init__(self, template, template_id=None, files=None):
         '''
@@ -49,441 +103,115 @@ class Template(collections.Mapping):
         self.id = template_id
         self.t = template
         self.files = files or {}
-        self.maps = self[MAPPINGS]
+        self.maps = self[self.MAPPINGS]
+        self.version = get_version(self.t, _template_classes.keys())
+
+    def __deepcopy__(self, memo):
+        return Template(copy.deepcopy(self.t, memo), files=self.files)
 
     @classmethod
-    def load(cls, context, template_id):
+    def load(cls, context, template_id, t=None):
         '''Retrieve a Template with the given ID from the database.'''
-        t = db_api.raw_template_get(context, template_id)
-        return cls(t.template, template_id)
+        if t is None:
+            t = db_api.raw_template_get(context, template_id)
+        return cls(t.template, template_id=template_id, files=t.files)
 
     def store(self, context=None):
         '''Store the Template in the database and return its ID.'''
+        rt = {
+            'template': self.t,
+            'files': self.files
+        }
         if self.id is None:
-            rt = {'template': self.t}
             new_rt = db_api.raw_template_create(context, rt)
             self.id = new_rt.id
-        return self.id
-
-    def __getitem__(self, section):
-        '''Get the relevant section in the template.'''
-        if section not in SECTIONS:
-            raise KeyError(_('"%s" is not a valid template section') % section)
-        if section == VERSION:
-            return self.t[section]
-
-        if section == DESCRIPTION:
-            default = 'No description'
         else:
-            default = {}
-
-        return self.t.get(section, default)
+            db_api.raw_template_update(context, self.id, rt)
+        return self.id
 
     def __iter__(self):
         '''Return an iterator over the section names.'''
-        return iter(SECTIONS)
+        return (s for s in self.SECTIONS
+                if s not in self.SECTIONS_NO_DIRECT_ACCESS)
 
     def __len__(self):
         '''Return the number of sections.'''
-        return len(SECTIONS)
+        return len(self.SECTIONS) - len(self.SECTIONS_NO_DIRECT_ACCESS)
 
-    def resolve_find_in_map(self, s):
-        '''
-        Resolve constructs of the form { "Fn::FindInMap" : [ "mapping",
-                                                             "key",
-                                                             "value" ] }
-        '''
-        def handle_find_in_map(args):
-            try:
-                name, key, value = args
-                return self.maps[name][key][value]
-            except (ValueError, TypeError) as ex:
-                raise KeyError(str(ex))
-
-        return _resolve(lambda k, v: k == 'Fn::FindInMap',
-                        handle_find_in_map, s)
-
-    @staticmethod
-    def resolve_availability_zones(s, stack):
-        '''
-            looking for { "Fn::GetAZs" : "str" }
-        '''
-        def match_get_az(key, value):
-            return (key == 'Fn::GetAZs' and
-                    isinstance(value, basestring))
-
-        def handle_get_az(ref):
-            if stack is None:
-                return ['nova']
-            else:
-                return stack.get_availability_zones()
-
-        return _resolve(match_get_az, handle_get_az, s)
-
-    @staticmethod
-    def resolve_param_refs(s, parameters):
-        '''
-        Resolve constructs of the form { "Ref" : "string" }
-        '''
-        def match_param_ref(key, value):
-            return (key == 'Ref' and
-                    isinstance(value, basestring) and
-                    value in parameters)
-
-        def handle_param_ref(ref):
-            try:
-                return parameters[ref]
-            except (KeyError, ValueError):
-                raise exception.UserParameterMissing(key=ref)
-
-        return _resolve(match_param_ref, handle_param_ref, s)
-
-    @staticmethod
-    def resolve_resource_refs(s, resources):
-        '''
-        Resolve constructs of the form { "Ref" : "resource" }
-        '''
-        def match_resource_ref(key, value):
-            return key == 'Ref' and value in resources
-
-        def handle_resource_ref(arg):
-            return resources[arg].FnGetRefId()
-
-        return _resolve(match_resource_ref, handle_resource_ref, s)
-
-    @staticmethod
-    def resolve_attributes(s, resources):
-        '''
-        Resolve constructs of the form { "Fn::GetAtt" : [ "WebServer",
-                                                          "PublicIp" ] }
-        '''
-        def handle_getatt(args):
-            resource, att = args
-            try:
-                r = resources[resource]
-                if r.state in (
-                        (r.CREATE, r.IN_PROGRESS),
-                        (r.CREATE, r.COMPLETE),
-                        (r.RESUME, r.IN_PROGRESS),
-                        (r.RESUME, r.COMPLETE),
-                        (r.UPDATE, r.IN_PROGRESS),
-                        (r.UPDATE, r.COMPLETE)):
-                    return r.FnGetAtt(att)
-            except KeyError:
-                raise exception.InvalidTemplateAttribute(resource=resource,
-                                                         key=att)
-
-        return _resolve(lambda k, v: k == 'Fn::GetAtt', handle_getatt, s)
-
-    @staticmethod
-    def reduce_joins(s):
-        '''
-        Reduces contiguous strings in Fn::Join to a single joined string
-        eg the following
-        { "Fn::Join" : [ " ", [ "str1", "str2", {"f": "b"}, "str3", "str4"]}
-        is reduced to
-        { "Fn::Join" : [ " ", [ "str1 str2", {"f": "b"}, "str3 str4"]}
-        '''
-        def handle_join(args):
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Join" must be a list'))
-            try:
-                delim, items = args
-            except ValueError as ex:
-                example = '"Fn::Join" : [ " ", [ "str1", "str2"]]'
-                raise ValueError(_('Incorrect arguments to '
-                                   '"Fn::Join" should be: %s') %
-                                 example)
-
-            if not isinstance(items, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Join" '
-                                  'not fully resolved'))
-            reduced = []
-            contiguous = []
-            for item in items:
-                if isinstance(item, (str, unicode)):
-                    contiguous.append(item)
-                else:
-                    if contiguous:
-                        reduced.append(delim.join(contiguous))
-                        contiguous = []
-                    reduced.append(item)
-            if contiguous:
-                reduced.append(delim.join(contiguous))
-            return {'Fn::Join': [delim, reduced]}
-
-        return _resolve(lambda k, v: k == 'Fn::Join', handle_join, s)
-
-    @staticmethod
-    def resolve_select(s):
-        '''
-        Resolve constructs of the form:
-        (for a list lookup)
-        { "Fn::Select" : [ "2", [ "apples", "grapes", "mangoes" ] ] }
-        returns "mangoes"
-        { "Fn::Select" : [ "3", [ "apples", "grapes", "mangoes" ] ] }
-        returns ""
-
-        (for a dict lookup)
-        { "Fn::Select" : [ "red", {"red": "a", "flu": "b"} ] }
-        returns "a"
-        { "Fn::Select" : [ "blue", {"red": "a", "flu": "b"} ] }
-        returns ""
-
-        Note: can raise ValueError and TypeError
-        '''
-        def handle_select(args):
-            example = '"Fn::Select": [1, ["str1", "str2"]]'
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Select" must be a list'))
-
-            try:
-                lookup, strings = args
-            except ValueError as ex:
-                raise ValueError(_('Incorrect arguments to '
-                                   '"Fn::Select" should be: %s') %
-                                 example)
-
-            if not isinstance(lookup, (basestring, int)):
-                raise TypeError(_('Index to "Fn::Select" should be either a '
-                                  'string or an integer value: %s') %
-                                example)
-            try:
-                index = int(lookup)
-            except ValueError as ex:
-                index = lookup
-
-            if strings == '':
-                # an empty string is a common response from other
-                # functions when result is not currently available.
-                # Handle by returning an empty string
-                return ''
-
-            if isinstance(strings, basestring):
-                # might be serialized json.
-                try:
-                    strings = json.loads(strings)
-                except ValueError as json_ex:
-                    raise ValueError(_('"Fn::Select" %s') % json_ex)
-
-            if isinstance(strings, (list, tuple)) and isinstance(index, int):
-                try:
-                    return strings[index]
-                except IndexError:
-                    return ''
-            if isinstance(strings, dict) and isinstance(index, basestring):
-                return strings.get(index, '')
-            if strings is None:
-                return ''
-
-            raise TypeError(_('Arguments to "Fn::Select" not fully resolved'))
-
-        return _resolve(lambda k, v: k == 'Fn::Select', handle_select, s)
-
-    @staticmethod
-    def resolve_joins(s):
-        '''
-        Resolve constructs of the form { "Fn::Join" : [ "delim", [ "str1",
-                                                                   "str2" ] }
-        '''
-        def handle_join(args):
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Join" must be a list'))
-
-            try:
-                delim, strings = args
-            except ValueError as ex:
-                example = '"Fn::Join" : [ " ", [ "str1", "str2"]]'
-                raise ValueError(_('Incorrect arguments to '
-                                   '"Fn::Join" should be: %s') %
-                                 example)
-
-            if not isinstance(strings, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Join" '
-                                  'not fully resolved'))
-
-            def empty_for_none(v):
-                if v is None:
-                    return ''
-                else:
-                    return v
-
-            return delim.join(empty_for_none(value) for value in strings)
-
-        return _resolve(lambda k, v: k == 'Fn::Join', handle_join, s)
-
-    @staticmethod
-    def resolve_split(s):
-        '''
-        Split strings in Fn::Split to a list of sub strings
-        eg the following
-        { "Fn::Split" : [ ",", "str1,str2,str3,str4"]}
-        is reduced to
-        {["str1", "str2", "str3", "str4"]}
-        '''
-        def handle_split(args):
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Split" must be a list'))
-
-            example = '"Fn::Split" : [ ",", "str1, str2"]]'
-            try:
-                delim, strings = args
-            except ValueError as ex:
-                raise ValueError(_('Incorrect arguments to "Fn::Split" '
-                                   'should be: %s') % example)
-            if not isinstance(strings, basestring):
-                raise TypeError(_('Incorrect arguments to '
-                                  '"Fn::Split" should be: %s') %
-                                example)
-            return strings.split(delim)
-        return _resolve(lambda k, v: k == 'Fn::Split', handle_split, s)
-
-    @staticmethod
-    def resolve_replace(s):
-        """
-        Resolve constructs of the form::
-
-          {"Fn::Replace": [
-            {'$var1': 'foo', '%var2%': 'bar'},
-            '$var1 is %var2%'
-          ]}
-
-        This is implemented using python str.replace on each key.
-        """
-        def handle_replace(args):
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Arguments to "Fn::Replace" must be a list'))
-
-            try:
-                mapping, string = args
-            except ValueError as ex:
-                example = ('{"Fn::Replace": '
-                           '[ {"$var1": "foo", "%var2%": "bar"}, '
-                           '"$var1 is %var2%"]}')
-                raise ValueError(_('Incorrect arguments to '
-                                   '"Fn::Replace" should be: %s') %
-                                 example)
-
-            if not isinstance(mapping, dict):
-                raise TypeError(
-                    _('Arguments to "Fn::Replace" not fully resolved'))
-            if not isinstance(string, basestring):
-                raise TypeError(
-                    _('Arguments to "Fn::Replace" not fully resolved'))
-
-            for k, v in mapping.items():
-                if v is None:
-                    v = ''
-                if not isinstance(v, basestring):
-                    raise TypeError(
-                        _('"Fn::Replace" value(%(value)s) for'
-                          ' "%(key)s" is not a string') %
-                        dict(value=str(v), key=k))
-                string = string.replace(k, v)
-            return string
-
-        return _resolve(lambda k, v: k == 'Fn::Replace', handle_replace, s)
-
-    @staticmethod
-    def resolve_base64(s):
-        '''
-        Resolve constructs of the form { "Fn::Base64" : "string" }
-        '''
-        def handle_base64(string):
-            if not isinstance(string, basestring):
-                raise TypeError(_('Arguments to "Fn::Base64" '
-                                  'not fully resolved'))
-            return string
-
-        return _resolve(lambda k, v: k == 'Fn::Base64', handle_base64, s)
-
-    @staticmethod
-    def resolve_member_list_to_map(s):
-        '''
-        Resolve constructs of the form::
-
-          {'Fn::MemberListToMap': ['Name', 'Value', ['.member.0.Name=key',
-                                                     '.member.0.Value=door']]}
-
-        The first two arguments are the names of the key and value.
-        '''
-
-        def handle_member_list_to_map(args):
-            correct = '''
-            {'Fn::MemberListToMap': ['Name', 'Value',
-                                     ['.member.0.Name=key',
-                                      '.member.0.Value=door']]}
-            '''
-            if not isinstance(args, (list, tuple)):
-                raise TypeError(_('Wrong Arguments try: "%s"') % correct)
-            if len(args) != 3:
-                raise TypeError(_('Wrong Arguments try: "%s"') % correct)
-            if not isinstance(args[0], basestring):
-                raise TypeError(_('Wrong Arguments try: "%s"') % correct)
-            if not isinstance(args[1], basestring):
-                raise TypeError(_('Wrong Arguments try: "%s"') % correct)
-            if not isinstance(args[2], (list, tuple)):
-                raise TypeError(_('Wrong Arguments try: "%s"') % correct)
-
-            partial = {}
-            for item in args[2]:
-                sp = item.split('=')
-                partial[sp[0]] = sp[1]
-            return aws_utils.extract_param_pairs(partial,
-                                                 prefix='',
-                                                 keyname=args[0],
-                                                 valuename=args[1])
-
-        return _resolve(lambda k, v: k == 'Fn::MemberListToMap',
-                        handle_member_list_to_map, s)
-
-    @staticmethod
-    def resolve_resource_facade(s, stack):
-        '''
-        Resolve constructs of the form {'Fn::ResourceFacade': 'Metadata'}
-        '''
-        resource_attributes = ('Metadata', 'DeletionPolicy', 'UpdatePolicy')
-
-        def handle_resource_facade(arg):
-            if arg not in resource_attributes:
-                raise ValueError(
-                    _('Incorrect arguments to "Fn::ResourceFacade" '
-                      'should be one of: %s') % str(resource_attributes))
-            try:
-                if arg == 'Metadata':
-                    return stack.parent_resource.metadata
-                return stack.parent_resource.t[arg]
-            except KeyError:
-                raise KeyError(_('"Fn::ResourceFacade" "%s" is not '
-                                 'specified in parent resource') %
-                               arg)
-
-        return _resolve(lambda k, v: k == 'Fn::ResourceFacade',
-                        handle_resource_facade,
-                        s)
-
+    @abc.abstractmethod
     def param_schemata(self):
-        parameters = self[PARAMETERS].iteritems()
-        return dict((name, ParamSchema(schema)) for name, schema in parameters)
+        '''Return a dict of parameters.Schema objects for the parameters.'''
+        pass
+
+    @abc.abstractmethod
+    def parameters(self, stack_identifier, user_params):
+        '''Return a parameters.Parameters object for the stack.'''
+        pass
+
+    @abc.abstractmethod
+    def resource_definitions(self, stack):
+        '''Return a dictionary of ResourceDefinition objects.'''
+        pass
+
+    @abc.abstractmethod
+    def add_resource(self, definition, name=None):
+        '''Add a resource to the template.
+
+        The resource is passed as a ResourceDefinition object. If no name is
+        specified, the name from the ResourceDefinition should be used.
+        '''
+        pass
+
+    def remove_resource(self, name):
+        '''Remove a resource from the template.'''
+        self.t.get(self.RESOURCES, {}).pop(name)
+
+    def parse(self, stack, snippet):
+        return parse(self.functions, stack, snippet)
+
+    def validate(self):
+        '''Validate the template.
+
+        Validates the top-level sections of the template as well as syntax
+        inside select sections. Some sections are not checked here but in
+        code parts that are responsible for working with the respective
+        sections (e.g. parameters are check by parameters schema class).
+
+        '''
+
+        # check top-level sections
+        for k in self.t.keys():
+            if k not in self.SECTIONS:
+                raise exception.InvalidTemplateSection(section=k)
+
+        # check resources
+        for res in self[self.RESOURCES].values():
+            try:
+                if not res.get('Type'):
+                    message = _('Every Resource object must '
+                                'contain a Type member.')
+                    raise exception.StackValidationFailed(message=message)
+            except AttributeError:
+                type_res = type(res)
+                if isinstance(res, unicode):
+                    type_res = "string"
+                message = _('Resources must contain Resource. '
+                            'Found a [%s] instead') % type_res
+                raise exception.StackValidationFailed(message=message)
 
 
-def _resolve(match, handle, snippet):
-    '''
-    Resolve constructs in a snippet of a template. The supplied match function
-    should return True if a particular key-value pair should be substituted,
-    and the handle function should return the correct substitution when passed
-    the argument list as parameters.
+def parse(functions, stack, snippet):
+    recurse = functools.partial(parse, functions, stack)
 
-    Returns a copy of the original snippet with the substitutions performed.
-    '''
-    recurse = lambda s: _resolve(match, handle, s)
-
-    if isinstance(snippet, dict):
+    if isinstance(snippet, collections.Mapping):
         if len(snippet) == 1:
-            k, v = snippet.items()[0]
-            if match(k, v):
-                return handle(recurse(v))
-        return dict((k, recurse(v)) for k, v in snippet.items())
-    elif isinstance(snippet, list):
-        return [recurse(s) for s in snippet]
-    return snippet
+            fn_name, args = next(six.iteritems(snippet))
+            Func = functions.get(fn_name)
+            if Func is not None:
+                return Func(stack, fn_name, recurse(args))
+        return dict((k, recurse(v)) for k, v in six.iteritems(snippet))
+    elif (not isinstance(snippet, basestring) and
+          isinstance(snippet, collections.Iterable)):
+        return [recurse(v) for v in snippet]
+    else:
+        return snippet

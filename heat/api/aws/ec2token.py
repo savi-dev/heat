@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,33 +12,30 @@
 #    under the License.
 
 import hashlib
+
+from oslo.config import cfg
+from oslo.utils import importutils
 import requests
+import webob
 
-from heat.openstack.common import gettextutils
+from heat.api.aws import exception
 from heat.api.aws.exception import HeatAPIException
-
-gettextutils.install('heat')
-
+from heat.common.i18n import _
+from heat.common.i18n import _LE
+from heat.common.i18n import _LI
 from heat.common import wsgi
 from heat.openstack.common import jsonutils as json
-from oslo.config import cfg
-from heat.openstack.common import importutils
-
-import webob
-from heat.api.aws import exception
-
 from heat.openstack.common import log as logging
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 opts = [
     cfg.StrOpt('auth_uri',
-               default=None,
-               help=_("Authentication Endpoint URI")),
+               help=_("Authentication Endpoint URI.")),
     cfg.BoolOpt('multi_cloud',
                 default=False,
-                help=_('Allow orchestration of multiple clouds')),
+                help=_('Allow orchestration of multiple clouds.')),
     cfg.ListOpt('allowed_auth_uris',
                 default=[],
                 help=_('Allowed keystone endpoints for auth_uri when '
@@ -71,11 +66,13 @@ class EC2Token(wsgi.Middleware):
         else:
             # Import auth_token to have keystone_authtoken settings setup.
             # We can use the auth_uri from the keystone_authtoken section
-            importutils.import_module('keystoneclient.middleware.auth_token')
+            importutils.import_module('keystonemiddleware.auth_token')
             return cfg.CONF.keystone_authtoken['auth_uri']
 
     @staticmethod
     def _conf_get_keystone_ec2_uri(auth_uri):
+        if auth_uri.endswith('ec2tokens'):
+            return auth_uri
         if auth_uri.endswith('/'):
             return '%sec2tokens' % auth_uri
         return '%s/ec2tokens' % auth_uri
@@ -87,8 +84,6 @@ class EC2Token(wsgi.Middleware):
         - params['Signature'] == version 0,1,2,3
         - params['X-Amz-Signature'] == version 4
         - header 'Authorization' == version 4
-        see http://docs.aws.amazon.com/general/latest/gr/
-            sigv4-signed-request-examples.html
         """
         sig = req.params.get('Signature') or req.params.get('X-Amz-Signature')
         if sig is None and 'Authorization' in req.headers:
@@ -130,10 +125,10 @@ class EC2Token(wsgi.Middleware):
             last_failure = None
             for auth_uri in self._conf_get('allowed_auth_uris'):
                 try:
-                    logger.debug("Attempt authorize on %s" % auth_uri)
+                    LOG.debug("Attempt authorize on %s" % auth_uri)
                     return self._authorize(req, auth_uri)
                 except HeatAPIException as e:
-                    logger.debug("Authorize failed: %s" % e.__class__)
+                    LOG.debug("Authorize failed: %s" % e.__class__)
                     last_failure = e
             raise last_failure or exception.HeatAccessDeniedError()
 
@@ -143,14 +138,14 @@ class EC2Token(wsgi.Middleware):
         # here so that we can use both authentication methods.
         # Returning here just means the user didn't supply AWS
         # authentication and we'll let the app try native keystone next.
-        logger.info("Checking AWS credentials..")
+        LOG.info(_LI("Checking AWS credentials.."))
 
         signature = self._get_signature(req)
         if not signature:
             if 'X-Auth-User' in req.headers:
                 return self.application
             else:
-                logger.info("No AWS Signature found.")
+                LOG.info(_LI("No AWS Signature found."))
                 raise exception.HeatIncompleteSignatureError()
 
         access = self._get_access(req)
@@ -158,14 +153,14 @@ class EC2Token(wsgi.Middleware):
             if 'X-Auth-User' in req.headers:
                 return self.application
             else:
-                logger.info("No AWSAccessKeyId/Authorization Credential")
+                LOG.info(_LI("No AWSAccessKeyId/Authorization Credential"))
                 raise exception.HeatMissingAuthenticationTokenError()
 
-        logger.info("AWS credentials found, checking against keystone.")
+        LOG.info(_LI("AWS credentials found, checking against keystone."))
 
         if not auth_uri:
-            logger.error("Ec2Token authorization failed, no auth_uri "
-                         "specified in config file")
+            LOG.error(_LE("Ec2Token authorization failed, no auth_uri "
+                          "specified in config file"))
             raise exception.HeatInternalFailureError(_('Service '
                                                        'misconfigured'))
         # Make a copy of args for authentication and signature verification.
@@ -189,7 +184,7 @@ class EC2Token(wsgi.Middleware):
         headers = {'Content-Type': 'application/json'}
 
         keystone_ec2_uri = self._conf_get_keystone_ec2_uri(auth_uri)
-        logger.info('Authenticating with %s' % keystone_ec2_uri)
+        LOG.info(_LI('Authenticating with %s'), keystone_ec2_uri)
         response = requests.post(keystone_ec2_uri, data=creds_json,
                                  headers=headers)
         result = response.json()
@@ -197,9 +192,9 @@ class EC2Token(wsgi.Middleware):
             token_id = result['access']['token']['id']
             tenant = result['access']['token']['tenant']['name']
             tenant_id = result['access']['token']['tenant']['id']
-            logger.info("AWS authentication successful.")
+            LOG.info(_LI("AWS authentication successful."))
         except (AttributeError, KeyError):
-            logger.info("AWS authentication failure.")
+            LOG.info(_LI("AWS authentication failure."))
             # Try to extract the reason for failure so we can return the
             # appropriate AWS error via raising an exception
             try:

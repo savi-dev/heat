@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,11 +11,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
+import six
 
 import testtools
-import json
 
 from heat.common import exception
+from heat.common import identifier
 from heat.engine import parameters
 from heat.engine import template
 
@@ -25,43 +26,55 @@ class ParameterTest(testtools.TestCase):
 
     def new_parameter(self, name, schema, value=None,
                       validate_value=True):
-        tmpl = template.Template({template.PARAMETERS: {name:
-                                                        schema}})
+        tmpl = template.Template({'HeatTemplateFormatVersion': '2012-12-12',
+                                  'Parameters': {name: schema}})
         schema = tmpl.param_schemata()[name]
-        return parameters.Parameter(name, schema, value,
-                                    validate_value)
+        param = parameters.Parameter(name, schema, value)
+        param.validate(validate_value)
+        return param
 
     def test_new_string(self):
         p = self.new_parameter('p', {'Type': 'String'}, validate_value=False)
-        self.assertTrue(isinstance(p, parameters.StringParam))
+        self.assertIsInstance(p, parameters.StringParam)
 
     def test_new_number(self):
         p = self.new_parameter('p', {'Type': 'Number'}, validate_value=False)
-        self.assertTrue(isinstance(p, parameters.NumberParam))
+        self.assertIsInstance(p, parameters.NumberParam)
 
     def test_new_list(self):
         p = self.new_parameter('p', {'Type': 'CommaDelimitedList'},
                                validate_value=False)
-        self.assertTrue(isinstance(p, parameters.CommaDelimitedListParam))
+        self.assertIsInstance(p, parameters.CommaDelimitedListParam)
 
     def test_new_json(self):
         p = self.new_parameter('p', {'Type': 'Json'}, validate_value=False)
-        self.assertTrue(isinstance(p, parameters.JsonParam))
+        self.assertIsInstance(p, parameters.JsonParam)
+
+    def test_json_return(self):
+        p = self.new_parameter('p', {'Type': 'Json'}, {"a": 1, "b": "a"})
+        self.assertEqual('{"a": 1, "b": "a"}', str(p))
+
+    def test_json_return_no_echo_true(self):
+        p = self.new_parameter(
+            'p', {'Type': 'Json', 'NoEcho': 'true'}, {"a": 1})
+        self.assertTrue(p.hidden())
+        self.assertEqual(str(p), '******')
 
     def test_new_bad_type(self):
-        self.assertRaises(ValueError, self.new_parameter, 'p',
-                          {'Type': 'List'})
+        self.assertRaises(exception.InvalidSchemaError, self.new_parameter,
+                          'p', {'Type': 'List'}, validate_value=False)
 
-    def test_new_no_type(self):
-        self.assertRaises(KeyError, self.new_parameter,
-                          'p', {'Default': 'blarg'})
+    def test_list_as_str(self):
+        p = self.new_parameter('p', {'Type': 'CommaDelimitedList'}, 'a,b,c')
+        self.assertEqual(['a', 'b', 'c'], p.value())
+        self.assertEqual('a,b,c', str(p))
 
     def test_default_no_override(self):
         p = self.new_parameter('defaulted', {'Type': 'String',
                                              'Default': 'blarg'})
         self.assertTrue(p.has_default())
-        self.assertEqual(p.default(), 'blarg')
-        self.assertEqual(p.value(), 'blarg')
+        self.assertEqual('blarg', p.default())
+        self.assertEqual('blarg', p.value())
 
     def test_default_override(self):
         p = self.new_parameter('defaulted',
@@ -69,28 +82,24 @@ class ParameterTest(testtools.TestCase):
                                 'Default': 'blarg'},
                                'wibble')
         self.assertTrue(p.has_default())
-        self.assertEqual(p.default(), 'blarg')
-        self.assertEqual(p.value(), 'wibble')
+        self.assertEqual('blarg', p.default())
+        self.assertEqual('wibble', p.value())
 
     def test_default_invalid(self):
         schema = {'Type': 'String',
                   'AllowedValues': ['foo'],
                   'ConstraintDescription': 'wibble',
                   'Default': 'bar'}
-        try:
-            self.new_parameter('p', schema, 'foo')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.InvalidSchemaError,
+                                self.new_parameter, 'p', schema, 'foo')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_no_echo_true(self):
         p = self.new_parameter('anechoic',
                                {'Type': 'String',
                                 'NoEcho': 'true'},
                                'wibble')
-        self.assertTrue(p.no_echo())
+        self.assertTrue(p.hidden())
         self.assertNotEqual(str(p), 'wibble')
 
     def test_no_echo_true_caps(self):
@@ -98,7 +107,7 @@ class ParameterTest(testtools.TestCase):
                                {'Type': 'String',
                                 'NoEcho': 'TrUe'},
                                'wibble')
-        self.assertTrue(p.no_echo())
+        self.assertTrue(p.hidden())
         self.assertNotEqual(str(p), 'wibble')
 
     def test_no_echo_false(self):
@@ -106,186 +115,174 @@ class ParameterTest(testtools.TestCase):
                                {'Type': 'String',
                                 'NoEcho': 'false'},
                                'wibble')
-        self.assertFalse(p.no_echo())
-        self.assertEqual(str(p), 'wibble')
+        self.assertFalse(p.hidden())
+        self.assertEqual('wibble', str(p))
 
     def test_description(self):
         description = 'Description of the parameter'
         p = self.new_parameter('p', {'Type': 'String',
                                      'Description': description},
                                validate_value=False)
-        self.assertEqual(p.description(), description)
+        self.assertEqual(description, p.description())
 
     def test_no_description(self):
         p = self.new_parameter('p', {'Type': 'String'}, validate_value=False)
-        self.assertEqual(p.description(), '')
+        self.assertEqual('', p.description())
 
     def test_string_len_good(self):
         schema = {'Type': 'String',
                   'MinLength': '3',
                   'MaxLength': '3'}
         p = self.new_parameter('p', schema, 'foo')
-        self.assertEqual(p.value(), 'foo')
+        self.assertEqual('foo', p.value())
 
     def test_string_underflow(self):
         schema = {'Type': 'String',
                   'ConstraintDescription': 'wibble',
                   'MinLength': '4'}
-        try:
-            self.new_parameter('p', schema, 'foo')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, 'foo')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_string_overflow(self):
         schema = {'Type': 'String',
                   'ConstraintDescription': 'wibble',
                   'MaxLength': '2'}
-        try:
-            self.new_parameter('p', schema, 'foo')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, 'foo')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_string_pattern_good(self):
         schema = {'Type': 'String',
                   'AllowedPattern': '[a-z]*'}
         p = self.new_parameter('p', schema, 'foo')
-        self.assertEqual(p.value(), 'foo')
+        self.assertEqual('foo', p.value())
 
     def test_string_pattern_bad_prefix(self):
         schema = {'Type': 'String',
                   'ConstraintDescription': 'wibble',
                   'AllowedPattern': '[a-z]*'}
-        try:
-            self.new_parameter('p', schema, '1foo')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, '1foo')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_string_pattern_bad_suffix(self):
         schema = {'Type': 'String',
                   'ConstraintDescription': 'wibble',
                   'AllowedPattern': '[a-z]*'}
-        try:
-            self.new_parameter('p', schema, 'foo1')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, 'foo1')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_string_value_list_good(self):
         schema = {'Type': 'String',
                   'AllowedValues': ['foo', 'bar', 'baz']}
         p = self.new_parameter('p', schema, 'bar')
-        self.assertEqual(p.value(), 'bar')
+        self.assertEqual('bar', p.value())
+
+    def test_string_value_unicode(self):
+        schema = {'Type': 'String'}
+        p = self.new_parameter('p', schema, u'test\u2665')
+        self.assertEqual(u'test\u2665', p.value())
 
     def test_string_value_list_bad(self):
         schema = {'Type': 'String',
                   'ConstraintDescription': 'wibble',
                   'AllowedValues': ['foo', 'bar', 'baz']}
-        try:
-            self.new_parameter('p', schema, 'blarg')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, 'blarg')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_number_int_good(self):
         schema = {'Type': 'Number',
                   'MinValue': '3',
                   'MaxValue': '3'}
         p = self.new_parameter('p', schema, '3')
-        self.assertEqual(p.value(), 3)
+        self.assertEqual(3, p.value())
 
-    def test_number_float_good(self):
+    def test_number_float_good_string(self):
         schema = {'Type': 'Number',
                   'MinValue': '3.0',
                   'MaxValue': '4.0'}
         p = self.new_parameter('p', schema, '3.5')
-        self.assertEqual(p.value(), 3.5)
+        self.assertEqual(3.5, p.value())
+
+    def test_number_float_good_number(self):
+        schema = {'Type': 'Number',
+                  'MinValue': '3.0',
+                  'MaxValue': '4.0'}
+        p = self.new_parameter('p', schema, 3.5)
+        self.assertEqual(3.5, p.value())
 
     def test_number_low(self):
         schema = {'Type': 'Number',
                   'ConstraintDescription': 'wibble',
                   'MinValue': '4'}
-        try:
-            self.new_parameter('p', schema, '3')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, '3')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_number_high(self):
         schema = {'Type': 'Number',
                   'ConstraintDescription': 'wibble',
                   'MaxValue': '2'}
-        try:
-            self.new_parameter('p', schema, '3')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, '3')
+        self.assertIn('wibble', six.text_type(err))
+
+    def test_number_bad(self):
+        schema = {'Type': 'Number'}
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, 'str')
+        self.assertIn('float', six.text_type(err))
 
     def test_number_value_list_good(self):
         schema = {'Type': 'Number',
                   'AllowedValues': ['1', '3', '5']}
         p = self.new_parameter('p', schema, '5')
-        self.assertEqual(p.value(), 5)
+        self.assertEqual(5, p.value())
 
     def test_number_value_list_bad(self):
         schema = {'Type': 'Number',
                   'ConstraintDescription': 'wibble',
                   'AllowedValues': ['1', '3', '5']}
-        try:
-            self.new_parameter('p', schema, '2')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, '2')
+        self.assertIn('wibble', six.text_type(err))
+
+    def test_list_value_list_default_empty(self):
+        schema = {'Type': 'CommaDelimitedList'}
+        schema['Default'] = ''
+        p = self.new_parameter('p', schema)
+        self.assertEqual([''], p.value())
 
     def test_list_value_list_good(self):
         schema = {'Type': 'CommaDelimitedList',
                   'AllowedValues': ['foo', 'bar', 'baz']}
         p = self.new_parameter('p', schema, 'baz,foo,bar')
-        self.assertEqual(p.value(), 'baz,foo,bar'.split(','))
+        self.assertEqual('baz,foo,bar'.split(','), p.value())
         schema['Default'] = []
         p = self.new_parameter('p', schema)
-        self.assertEqual(p.value(), [])
+        self.assertEqual([], p.value())
         schema['Default'] = 'baz,foo,bar'
         p = self.new_parameter('p', schema)
-        self.assertEqual(p.value(), 'baz,foo,bar'.split(','))
+        self.assertEqual('baz,foo,bar'.split(','), p.value())
 
     def test_list_value_list_bad(self):
         schema = {'Type': 'CommaDelimitedList',
                   'ConstraintDescription': 'wibble',
                   'AllowedValues': ['foo', 'bar', 'baz']}
-        try:
-            self.new_parameter('p', schema, 'foo,baz,blarg')
-        except ValueError as ve:
-            msg = str(ve)
-            self.assertNotEqual(msg.find('wibble'), -1)
-        else:
-            self.fail('ValueError not raised')
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema,
+                                'foo,baz,blarg')
+        self.assertIn('wibble', six.text_type(err))
 
     def test_map_value(self):
-        '''Happy path for value thats already a map.'''
+        '''Happy path for value that's already a map.'''
         schema = {'Type': 'Json'}
         val = {"foo": "bar", "items": [1, 2, 3]}
-        val_s = json.dumps(val)
         p = self.new_parameter('p', schema, val)
-        self.assertEqual(val_s, p.value())
+        self.assertEqual(val, p.value())
         self.assertEqual(val, p.parsed)
 
     def test_map_value_bad(self):
@@ -293,12 +290,9 @@ class ParameterTest(testtools.TestCase):
         schema = {'Type': 'Json',
                   'ConstraintDescription': 'wibble'}
         val = {"foo": "bar", "not_json": len}
-        try:
-            self.new_parameter('p', schema, val)
-        except ValueError as verr:
-            self.assertIn('Value must be valid JSON', str(verr))
-        else:
-            self.fail("Value error not raised")
+        err = self.assertRaises(ValueError,
+                                self.new_parameter, 'p', schema, val)
+        self.assertIn('Value must be valid JSON', six.text_type(err))
 
     def test_map_value_parse(self):
         '''Happy path for value that's a string.'''
@@ -306,7 +300,7 @@ class ParameterTest(testtools.TestCase):
         val = {"foo": "bar", "items": [1, 2, 3]}
         val_s = json.dumps(val)
         p = self.new_parameter('p', schema, val_s)
-        self.assertEqual(val_s, p.value())
+        self.assertEqual(val, p.value())
         self.assertEqual(val, p.parsed)
 
     def test_map_value_bad_parse(self):
@@ -314,64 +308,76 @@ class ParameterTest(testtools.TestCase):
         schema = {'Type': 'Json',
                   'ConstraintDescription': 'wibble'}
         val = "I am not a map"
-        try:
-            self.new_parameter('p', schema, val)
-        except ValueError as verr:
-            self.assertIn('Value must be valid JSON', str(verr))
-        else:
-            self.fail("Value error not raised")
-
-    def test_map_values_good(self):
-        '''Happy path for map keys.'''
-        schema = {'Type': 'Json',
-                  'AllowedValues': ["foo", "bar", "baz"]}
-        val = {"foo": "bar", "baz": [1, 2, 3]}
-        val_s = json.dumps(val)
-        p = self.new_parameter('p', schema, val_s)
-        self.assertEqual(val_s, p.value())
-        self.assertEqual(val, p.parsed)
-
-    def test_map_values_bad(self):
-        '''Test failure of invalid map keys.'''
-        schema = {'Type': 'Json',
-                  'AllowedValues': ["foo", "bar", "baz"]}
-        val = {"foo": "bar", "items": [1, 2, 3]}
-        try:
-            self.new_parameter('p', schema, val)
-        except ValueError as verr:
-            self.assertIn("items", str(verr))
-        else:
-            self.fail("Value error not raised")
+        err = self.assertRaises(ValueError,
+                                self.new_parameter, 'p', schema, val)
+        self.assertIn('Value must be valid JSON', six.text_type(err))
 
     def test_map_underrun(self):
         '''Test map length under MIN_LEN.'''
         schema = {'Type': 'Json',
                   'MinLength': 3}
         val = {"foo": "bar", "items": [1, 2, 3]}
-        try:
-            self.new_parameter('p', schema, val)
-        except ValueError as verr:
-            self.assertIn('underflows', str(verr))
-        else:
-            self.fail("Value error not raised")
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, val)
+        self.assertIn('out of range', six.text_type(err))
 
     def test_map_overrun(self):
         '''Test map length over MAX_LEN.'''
         schema = {'Type': 'Json',
                   'MaxLength': 1}
         val = {"foo": "bar", "items": [1, 2, 3]}
-        try:
-            self.new_parameter('p', schema, val)
-        except ValueError as verr:
-            self.assertIn('overflows', str(verr))
-        else:
-            self.fail("Value error not raised")
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'p', schema, val)
+        self.assertIn('out of range', six.text_type(err))
+
+    def test_json_list(self):
+        schema = {'Type': 'Json'}
+        val = ["fizz", "buzz"]
+        p = self.new_parameter('p', schema, val)
+        self.assertIsInstance(p.value(), list)
+        self.assertIn("fizz", p.value())
+        self.assertIn("buzz", p.value())
+
+    def test_json_string_list(self):
+        schema = {'Type': 'Json'}
+        val = '["fizz", "buzz"]'
+        p = self.new_parameter('p', schema, val)
+        self.assertIsInstance(p.value(), list)
+        self.assertIn("fizz", p.value())
+        self.assertIn("buzz", p.value())
+
+    def test_bool_value_true(self):
+        schema = {'Type': 'Boolean'}
+        for val in ('1', 't', 'true', 'on', 'y', 'yes', True, 1):
+            bo = self.new_parameter('bo', schema, val)
+            self.assertEqual(True, bo.value())
+
+    def test_bool_value_false(self):
+        schema = {'Type': 'Boolean'}
+        for val in ('0', 'f', 'false', 'off', 'n', 'no', False, 0):
+            bo = self.new_parameter('bo', schema, val)
+            self.assertEqual(False, bo.value())
+
+    def test_bool_value_invalid(self):
+        schema = {'Type': 'Boolean'}
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'bo', schema, 'foo')
+        self.assertIn("Unrecognized value 'foo'", unicode(err))
 
     def test_missing_param(self):
         '''Test missing user parameter.'''
         self.assertRaises(exception.UserParameterMissing,
                           self.new_parameter, 'p',
                           {'Type': 'String'})
+
+    def test_param_name_in_error_message(self):
+        schema = {'Type': 'String',
+                  'AllowedPattern': '[a-z]*'}
+        err = self.assertRaises(exception.StackValidationFailed,
+                                self.new_parameter, 'testparam', schema, '234')
+        expected = 'Parameter \'testparam\' is invalid: '\
+            '"234" does not match pattern "[a-z]*"'
+        self.assertEqual(expected, unicode(err))
 
 
 params_schema = json.loads('''{
@@ -386,35 +392,48 @@ params_schema = json.loads('''{
 
 
 class ParametersTest(testtools.TestCase):
-    def new_parameters(self, stack_name, tmpl, user_params={}, stack_id=None,
-                       validate_value=True):
+    def new_parameters(self, stack_name, tmpl, user_params=None,
+                       stack_id=None, validate_value=True):
+        user_params = user_params or {}
+        tmpl.update({'HeatTemplateFormatVersion': '2012-12-12'})
         tmpl = template.Template(tmpl)
-        return parameters.Parameters(stack_name, tmpl, user_params, stack_id,
-                                     validate_value)
+        params = tmpl.parameters(
+            identifier.HeatIdentifier('', stack_name, stack_id),
+            user_params)
+        params.validate(validate_value)
+        return params
 
     def test_pseudo_params(self):
-        params = self.new_parameters('test_stack', {"Parameters": {}})
+        stack_name = 'test_stack'
+        params = self.new_parameters(stack_name, {"Parameters": {}})
 
-        self.assertEqual(params['AWS::StackName'], 'test_stack')
-        self.assertEqual(params['AWS::StackId'], 'None')
-        self.assertTrue('AWS::Region' in params)
+        self.assertEqual('test_stack', params['AWS::StackName'])
+        self.assertEqual(
+            'arn:openstack:heat:::stacks/{0}/{1}'.format(stack_name, 'None'),
+            params['AWS::StackId'])
+
+        self.assertIn('AWS::Region', params)
 
     def test_pseudo_param_stackid(self):
-        params = self.new_parameters('test_stack', {'Parameters': {}},
-                                     stack_id='123::foo')
+        stack_name = 'test_stack'
+        params = self.new_parameters(stack_name, {'Parameters': {}},
+                                     stack_id='abc123')
 
-        self.assertEqual(params['AWS::StackId'], '123::foo')
-        params.set_stack_id('456::bar')
-        self.assertEqual(params['AWS::StackId'], '456::bar')
+        self.assertEqual(
+            'arn:openstack:heat:::stacks/{0}/{1}'.format(stack_name, 'abc123'),
+            params['AWS::StackId'])
+        stack_identifier = identifier.HeatIdentifier('', '', 'def456')
+        params.set_stack_id(stack_identifier)
+        self.assertEqual(stack_identifier.arn(), params['AWS::StackId'])
 
     def test_schema_invariance(self):
         params1 = self.new_parameters('test', params_schema,
                                       {'User': 'foo',
                                        'Defaulted': 'wibble'})
-        self.assertEqual(params1['Defaulted'], 'wibble')
+        self.assertEqual('wibble', params1['Defaulted'])
 
         params2 = self.new_parameters('test', params_schema, {'User': 'foo'})
-        self.assertEqual(params2['Defaulted'], 'foobar')
+        self.assertEqual('foobar', params2['Defaulted'])
 
     def test_to_dict(self):
         template = {'Parameters': {'Foo': {'Type': 'String'},
@@ -422,10 +441,10 @@ class ParametersTest(testtools.TestCase):
         params = self.new_parameters('test_params', template, {'Foo': 'foo'})
 
         as_dict = dict(params)
-        self.assertEqual(as_dict['Foo'], 'foo')
-        self.assertEqual(as_dict['Bar'], 42)
-        self.assertEqual(as_dict['AWS::StackName'], 'test_params')
-        self.assertTrue('AWS::Region' in as_dict)
+        self.assertEqual('foo', as_dict['Foo'])
+        self.assertEqual(42, as_dict['Bar'])
+        self.assertEqual('test_params', as_dict['AWS::StackName'])
+        self.assertIn('AWS::Region', as_dict)
 
     def test_map(self):
         template = {'Parameters': {'Foo': {'Type': 'String'},
@@ -438,21 +457,29 @@ class ParametersTest(testtools.TestCase):
                     'AWS::StackId': True,
                     'AWS::StackName': True}
 
-        self.assertEqual(params.map(lambda p: p.has_default()), expected)
+        self.assertEqual(expected, params.map(lambda p: p.has_default()))
 
     def test_map_str(self):
         template = {'Parameters': {'Foo': {'Type': 'String'},
-                                   'Bar': {'Type': 'Number'}}}
-        params = self.new_parameters('test_params', template,
-                                     {'Foo': 'foo', 'Bar': '42'})
+                                   'Bar': {'Type': 'Number'},
+                                   'Uni': {'Type': 'String'}}}
+        stack_name = 'test_params'
+        params = self.new_parameters(stack_name, template,
+                                     {'Foo': 'foo',
+                                      'Bar': '42',
+                                      'Uni': u'test\u2665'})
 
         expected = {'Foo': 'foo',
                     'Bar': '42',
+                    'Uni': 'test\xe2\x99\xa5',
                     'AWS::Region': 'ap-southeast-1',
-                    'AWS::StackId': 'None',
+                    'AWS::StackId':
+                    'arn:openstack:heat:::stacks/{0}/{1}'.format(
+                        stack_name,
+                        'None'),
                     'AWS::StackName': 'test_params'}
 
-        self.assertEqual(params.map(str), expected)
+        self.assertEqual(expected, params.map(str))
 
     def test_unknown_params(self):
         user_params = {'Foo': 'wibble'}
@@ -474,7 +501,25 @@ class ParametersTest(testtools.TestCase):
         params = {'Parameters': {'Foo': {'Type': 'String'},
                                  'NoAttr': 'No attribute.',
                                  'Bar': {'Type': 'Number', 'Default': '1'}}}
-        self.assertRaises(exception.InvalidTemplateParameter,
+        self.assertRaises(exception.InvalidSchemaError,
                           self.new_parameters,
                           'test',
                           params)
+
+
+class ParameterSchemaTest(testtools.TestCase):
+
+    def test_validate_schema_wrong_key(self):
+        error = self.assertRaises(exception.InvalidSchemaError,
+                                  parameters.Schema.from_dict, 'param_name',
+                                  {"foo": "bar"})
+        self.assertEqual("Invalid key 'foo' for parameter (param_name)",
+                         six.text_type(error))
+
+    def test_validate_schema_no_type(self):
+        error = self.assertRaises(exception.InvalidSchemaError,
+                                  parameters.Schema.from_dict,
+                                  'broken',
+                                  {"Description": "Hi!"})
+        self.assertEqual("Missing parameter type for parameter: broken",
+                         six.text_type(error))

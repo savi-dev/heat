@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -14,21 +13,21 @@
 
 from oslo.config import cfg
 
-cfg.CONF.import_opt('event_purge_batch_size', 'heat.common.config')
-cfg.CONF.import_opt('max_events_per_stack', 'heat.common.config')
-
-import heat.db.api as db_api
+from heat.db import api as db_api
+from heat.engine import event
 from heat.engine import parser
 from heat.engine import resource
+from heat.engine import rsrc_defn
 from heat.engine import template
-from heat.engine import event
-
 from heat.tests.common import HeatTestCase
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
 
+cfg.CONF.import_opt('event_purge_batch_size', 'heat.common.config')
+cfg.CONF.import_opt('max_events_per_stack', 'heat.common.config')
 
 tmpl = {
+    'HeatTemplateFormatVersion': '2012-12-12',
     'Resources': {
         'EventTestResource': {
             'Type': 'ResourceWithRequiredProps',
@@ -44,7 +43,6 @@ class EventTest(HeatTestCase):
         super(EventTest, self).setUp()
         self.username = 'event_test_user'
 
-        utils.setup_dummy_db()
         self.ctx = utils.dummy_context()
 
         self.m.ReplayAll()
@@ -68,7 +66,7 @@ class EventTest(HeatTestCase):
                         self.resource.name, self.resource.type())
 
         e.store()
-        self.assertNotEqual(e.id, None)
+        self.assertIsNotNone(e.id)
 
         loaded_e = event.Event.load(self.ctx, e.id)
 
@@ -78,7 +76,7 @@ class EventTest(HeatTestCase):
         self.assertEqual('TEST', loaded_e.action)
         self.assertEqual('IN_PROGRESS', loaded_e.status)
         self.assertEqual('Testing', loaded_e.reason)
-        self.assertNotEqual(None, loaded_e.timestamp)
+        self.assertIsNotNone(loaded_e.timestamp)
         self.assertEqual({'Foo': 'goo'}, loaded_e.resource_properties)
 
     def test_load_given_stack_event(self):
@@ -89,7 +87,7 @@ class EventTest(HeatTestCase):
                         self.resource.name, self.resource.type())
 
         e.store()
-        self.assertNotEqual(e.id, None)
+        self.assertIsNotNone(e.id)
 
         ev = db_api.event_get(self.ctx, e.id)
 
@@ -101,7 +99,7 @@ class EventTest(HeatTestCase):
         self.assertEqual('TEST', loaded_e.action)
         self.assertEqual('IN_PROGRESS', loaded_e.status)
         self.assertEqual('Testing', loaded_e.reason)
-        self.assertNotEqual(None, loaded_e.timestamp)
+        self.assertIsNotNone(loaded_e.timestamp)
         self.assertEqual({'Foo': 'goo'}, loaded_e.resource_properties)
 
     def test_store_caps_events(self):
@@ -124,24 +122,36 @@ class EventTest(HeatTestCase):
         self.assertEqual('arizona', events[0].physical_resource_id)
 
     def test_identifier(self):
+        event_uuid = 'abc123yc-9f88-404d-a85b-531529456xyz'
         e = event.Event(self.ctx, self.stack, 'TEST', 'IN_PROGRESS', 'Testing',
                         'wibble', self.resource.properties,
-                        self.resource.name, self.resource.type())
+                        self.resource.name, self.resource.type(),
+                        uuid=event_uuid)
 
-        eid = e.store()
+        e.store()
         expected_identifier = {
             'stack_name': self.stack.name,
             'stack_id': self.stack.id,
             'tenant': self.ctx.tenant_id,
-            'path': '/resources/EventTestResource/events/%s' % str(eid)
+            'path': '/resources/EventTestResource/events/%s' % str(event_uuid)
         }
         self.assertEqual(expected_identifier, e.identifier())
 
+    def test_identifier_is_none(self):
+        e = event.Event(self.ctx, self.stack, 'TEST', 'IN_PROGRESS', 'Testing',
+                        'wibble', self.resource.properties,
+                        self.resource.name, self.resource.type())
+
+        e.store()
+        self.assertIsNone(e.identifier())
+
     def test_badprop(self):
-        tmpl = {'Type': 'ResourceWithRequiredProps',
-                'Properties': {'Foo': False}}
         rname = 'bad_resource'
-        res = generic_rsrc.ResourceWithRequiredProps(rname, tmpl, self.stack)
+        defn = rsrc_defn.ResourceDefinition(rname,
+                                            'ResourceWithRequiredProps',
+                                            {'Foo': False})
+
+        res = generic_rsrc.ResourceWithRequiredProps(rname, defn, self.stack)
         e = event.Event(self.ctx, self.stack, 'TEST', 'IN_PROGRESS', 'Testing',
                         'wibble', res.properties, res.name, res.type())
-        self.assertTrue('Error' in e.resource_properties)
+        self.assertIn('Error', e.resource_properties)

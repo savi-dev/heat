@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # Copyright 2012, Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,75 +18,83 @@ Unit Tests for heat.rpc.client
 """
 
 
-from oslo.config import cfg
+import copy
+import mock
 import stubout
 import testtools
 
 from heat.common import identifier
-from heat.rpc import api as rpc_api
+from heat.common import messaging
 from heat.rpc import client as rpc_client
-from heat.openstack.common import rpc
 from heat.tests import utils
 
 
 class EngineRpcAPITestCase(testtools.TestCase):
 
     def setUp(self):
+        messaging.setup("fake://", optional=True)
+        self.addCleanup(messaging.cleanup)
         self.context = utils.dummy_context()
-        cfg.CONF.set_default('rpc_backend',
-                             'heat.openstack.common.rpc.impl_fake')
-        cfg.CONF.set_default('verbose', True)
-        cfg.CONF.set_default('host', 'host')
 
         self.stubs = stubout.StubOutForTesting()
         self.identity = dict(identifier.HeatIdentifier('engine_test_tenant',
                                                        '6',
                                                        'wordpress'))
+        self.rpcapi = rpc_client.EngineClient()
         super(EngineRpcAPITestCase, self).setUp()
 
     def _test_engine_api(self, method, rpc_method, **kwargs):
         ctxt = utils.dummy_context()
-        if 'rpcapi_class' in kwargs:
-            rpcapi_class = kwargs['rpcapi_class']
-            del kwargs['rpcapi_class']
-        else:
-            rpcapi_class = rpc_client.EngineClient
-        rpcapi = rpcapi_class()
         expected_retval = 'foo' if method == 'call' else None
 
-        expected_version = kwargs.pop('version', rpcapi.BASE_RPC_API_VERSION)
-        expected_msg = rpcapi.make_msg(method, **kwargs)
+        kwargs.pop('version', None)
 
-        expected_msg['version'] = expected_version
-        expected_topic = rpc_api.ENGINE_TOPIC
+        if 'expected_message' in kwargs:
+            expected_message = kwargs['expected_message']
+            del kwargs['expected_message']
+        else:
+            expected_message = self.rpcapi.make_msg(method, **kwargs)
 
         cast_and_call = ['delete_stack']
         if rpc_method == 'call' and method in cast_and_call:
             kwargs['cast'] = False
 
-        self.fake_args = None
-        self.fake_kwargs = None
+        with mock.patch.object(self.rpcapi, rpc_method) as mock_rpc_method:
+            mock_rpc_method.return_value = expected_retval
 
-        def _fake_rpc_method(*args, **kwargs):
-            self.fake_args = args
-            self.fake_kwargs = kwargs
-            if expected_retval:
-                return expected_retval
+            retval = getattr(self.rpcapi, method)(ctxt, **kwargs)
 
-        self.stubs.Set(rpc, rpc_method, _fake_rpc_method)
-
-        retval = getattr(rpcapi, method)(ctxt, **kwargs)
-
-        self.assertEqual(retval, expected_retval)
-        expected_args = [ctxt, expected_topic, expected_msg]
-        for arg, expected_arg in zip(self.fake_args, expected_args):
-            self.assertEqual(arg, expected_arg)
+            self.assertEqual(expected_retval, retval)
+            expected_args = [ctxt, expected_message, mock.ANY]
+            actual_args, _ = mock_rpc_method.call_args
+            for expected_arg, actual_arg in zip(expected_args,
+                                                actual_args):
+                self.assertEqual(expected_arg, actual_arg)
 
     def test_authenticated_to_backend(self):
         self._test_engine_api('authenticated_to_backend', 'call')
 
     def test_list_stacks(self):
-        self._test_engine_api('list_stacks', 'call')
+        default_args = {
+            'limit': mock.ANY,
+            'sort_keys': mock.ANY,
+            'marker': mock.ANY,
+            'sort_dir': mock.ANY,
+            'filters': mock.ANY,
+            'tenant_safe': mock.ANY,
+            'show_deleted': mock.ANY,
+            'show_nested': mock.ANY,
+        }
+        self._test_engine_api('list_stacks', 'call', **default_args)
+
+    def test_count_stacks(self):
+        default_args = {
+            'filters': mock.ANY,
+            'tenant_safe': mock.ANY,
+            'show_deleted': mock.ANY,
+            'show_nested': mock.ANY,
+        }
+        self._test_engine_api('count_stacks', 'call', **default_args)
 
     def test_identify_stack(self):
         self._test_engine_api('identify_stack', 'call',
@@ -96,12 +103,24 @@ class EngineRpcAPITestCase(testtools.TestCase):
     def test_show_stack(self):
         self._test_engine_api('show_stack', 'call', stack_identity='wordpress')
 
-    def test_create_stack(self):
-        self._test_engine_api('create_stack', 'call', stack_name='wordpress',
+    def test_preview_stack(self):
+        self._test_engine_api('preview_stack', 'call', stack_name='wordpress',
                               template={u'Foo': u'bar'},
                               params={u'InstanceType': u'm1.xlarge'},
                               files={u'a_file': u'the contents'},
                               args={'timeout_mins': u'30'})
+
+    def test_create_stack(self):
+        kwargs = dict(stack_name='wordpress',
+                      template={u'Foo': u'bar'},
+                      params={u'InstanceType': u'm1.xlarge'},
+                      files={u'a_file': u'the contents'},
+                      args={'timeout_mins': u'30'})
+        call_kwargs = copy.deepcopy(kwargs)
+        call_kwargs['owner_id'] = None
+        expected_message = self.rpcapi.make_msg('create_stack', **call_kwargs)
+        kwargs['expected_message'] = expected_message
+        self._test_engine_api('create_stack', 'call', **kwargs)
 
     def test_update_stack(self):
         self._test_engine_api('update_stack', 'call',
@@ -109,7 +128,7 @@ class EngineRpcAPITestCase(testtools.TestCase):
                               template={u'Foo': u'bar'},
                               params={u'InstanceType': u'm1.xlarge'},
                               files={},
-                              args={})
+                              args=mock.ANY)
 
     def test_get_template(self):
         self._test_engine_api('get_template', 'call',
@@ -125,10 +144,12 @@ class EngineRpcAPITestCase(testtools.TestCase):
 
     def test_validate_template(self):
         self._test_engine_api('validate_template', 'call',
-                              template={u'Foo': u'bar'})
+                              template={u'Foo': u'bar'},
+                              params={u'Egg': u'spam'})
 
     def test_list_resource_types(self):
-        self._test_engine_api('list_resource_types', 'call')
+        self._test_engine_api('list_resource_types', 'call',
+                              support_status=None, version='1.1')
 
     def test_resource_schema(self):
         self._test_engine_api('resource_schema', 'call', type_name="TYPE")
@@ -137,8 +158,13 @@ class EngineRpcAPITestCase(testtools.TestCase):
         self._test_engine_api('generate_template', 'call', type_name="TYPE")
 
     def test_list_events(self):
-        self._test_engine_api('list_events', 'call',
-                              stack_identity=self.identity)
+        kwargs = {'stack_identity': self.identity,
+                  'limit': None,
+                  'marker': None,
+                  'sort_keys': None,
+                  'sort_dir': None,
+                  'filters': None}
+        self._test_engine_api('list_events', 'call', **kwargs)
 
     def test_describe_stack_resource(self):
         self._test_engine_api('describe_stack_resource', 'call',
@@ -156,7 +182,8 @@ class EngineRpcAPITestCase(testtools.TestCase):
 
     def test_list_stack_resources(self):
         self._test_engine_api('list_stack_resources', 'call',
-                              stack_identity=self.identity)
+                              stack_identity=self.identity,
+                              nested_depth=0)
 
     def test_stack_suspend(self):
         self._test_engine_api('stack_suspend', 'call',
@@ -164,6 +191,10 @@ class EngineRpcAPITestCase(testtools.TestCase):
 
     def test_stack_resume(self):
         self._test_engine_api('stack_resume', 'call',
+                              stack_identity=self.identity)
+
+    def test_stack_cancel_update(self):
+        self._test_engine_api('stack_cancel_update', 'call',
                               stack_identity=self.identity)
 
     def test_metadata_update(self):
@@ -194,3 +225,75 @@ class EngineRpcAPITestCase(testtools.TestCase):
     def test_set_watch_state(self):
         self._test_engine_api('set_watch_state', 'call',
                               watch_name='watch1', state="xyz")
+
+    def test_show_software_config(self):
+        self._test_engine_api('show_software_config', 'call',
+                              config_id='cda89008-6ea6-4057-b83d-ccde8f0b48c9')
+
+    def test_create_software_config(self):
+        self._test_engine_api('create_software_config', 'call',
+                              group='Heat::Shell',
+                              name='config_mysql',
+                              config='#!/bin/bash',
+                              inputs=[],
+                              outputs=[],
+                              options={})
+
+    def test_delete_software_config(self):
+        self._test_engine_api('delete_software_config', 'call',
+                              config_id='cda89008-6ea6-4057-b83d-ccde8f0b48c9')
+
+    def test_list_software_deployments(self):
+        self._test_engine_api('list_software_deployments', 'call',
+                              server_id=None)
+        self._test_engine_api('list_software_deployments', 'call',
+                              server_id='9dc13236-d342-451f-a885-1c82420ba5ed')
+
+    def test_show_software_deployment(self):
+        deployment_id = '86729f02-4648-44d8-af44-d0ec65b6abc9'
+        self._test_engine_api('show_software_deployment', 'call',
+                              deployment_id=deployment_id)
+
+    def test_create_software_deployment(self):
+        self._test_engine_api(
+            'create_software_deployment', 'call',
+            server_id='9f1f0e00-05d2-4ca5-8602-95021f19c9d0',
+            config_id='48e8ade1-9196-42d5-89a2-f709fde42632',
+            stack_user_project_id='65728b74-cfe7-4f17-9c15-11d4f686e591',
+            input_values={},
+            action='INIT',
+            status='COMPLETE',
+            status_reason=None)
+
+    def test_update_software_deployment(self):
+        deployment_id = '86729f02-4648-44d8-af44-d0ec65b6abc9'
+        self._test_engine_api('update_software_deployment', 'call',
+                              deployment_id=deployment_id,
+                              config_id='48e8ade1-9196-42d5-89a2-f709fde42632',
+                              input_values={},
+                              output_values={},
+                              action='DEPLOYED',
+                              status='COMPLETE',
+                              status_reason=None)
+
+    def test_delete_software_deployment(self):
+        deployment_id = '86729f02-4648-44d8-af44-d0ec65b6abc9'
+        self._test_engine_api('delete_software_deployment', 'call',
+                              deployment_id=deployment_id)
+
+    def test_show_snapshot(self):
+        snapshot_id = '86729f02-4648-44d8-af44-d0ec65b6abc9'
+        self._test_engine_api('show_snapshot', 'call',
+                              stack_identity=self.identity,
+                              snapshot_id=snapshot_id)
+
+    def test_stack_snapshot(self):
+        self._test_engine_api(
+            'stack_snapshot', 'call', stack_identity=self.identity,
+            name='snap1')
+
+    def test_delete_snapshot(self):
+        snapshot_id = '86729f02-4648-44d8-af44-d0ec65b6abc9'
+        self._test_engine_api('delete_snapshot', 'call',
+                              stack_identity=self.identity,
+                              snapshot_id=snapshot_id)

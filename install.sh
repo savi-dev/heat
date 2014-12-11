@@ -73,8 +73,7 @@ basic_configuration() {
     if echo $conf_path | grep ".conf$" >/dev/null 2>&1
     then
         iniset $target DEFAULT auth_encryption_key `hexdump -n 16 -v -e '/1 "%02x"' /dev/random`
-        iniset $target DEFAULT db_backend heat.db.sqlalchemy.api
-        iniset $target DEFAULT sql_connection "mysql://heat:heat@localhost/heat"
+        iniset $target database connection "mysql://heat:heat@localhost/heat"
 
         BRIDGE_IP=127.0.0.1
         iniset $target DEFAULT heat_metadata_server_url "http://${BRIDGE_IP}:8000/"
@@ -84,11 +83,11 @@ basic_configuration() {
         if detect_rabbit
         then
             echo "rabbitmq detected, configuring $conf_path for rabbit" >&2
-            iniset $conf_path DEFAULT rpc_backend heat.openstack.common.rpc.impl_kombu
+            iniset $conf_path DEFAULT rpc_backend kombu
             iniset $conf_path DEFAULT rabbit_password guest
         else
             echo "qpid detected, configuring $conf_path for qpid" >&2
-            iniset $conf_path DEFAULT rpc_backend heat.openstack.common.rpc.impl_qpid
+            iniset $conf_path DEFAULT rpc_backend qpid
         fi
     fi
 }

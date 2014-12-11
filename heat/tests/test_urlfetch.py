@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,18 +11,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo.config import cfg
 import requests
 from requests import exceptions
-import urllib2
-import cStringIO
-
-from oslo.config import cfg
+import six
+from six.moves import cStringIO
+from six.moves import urllib
 
 from heat.common import urlfetch
 from heat.tests.common import HeatTestCase
 
 
-class Response:
+class Response(object):
     def __init__(self, buf=''):
         self.buf = buf
 
@@ -44,15 +42,16 @@ class UrlFetchTest(HeatTestCase):
 
     def test_file_scheme_default_behaviour(self):
         self.m.ReplayAll()
-        self.assertRaises(IOError, urlfetch.get, 'file:///etc/profile')
+        self.assertRaises(urlfetch.URLFetchError,
+                          urlfetch.get, 'file:///etc/profile')
         self.m.VerifyAll()
 
     def test_file_scheme_supported(self):
         data = '{ "foo": "bar" }'
         url = 'file:///etc/profile'
 
-        self.m.StubOutWithMock(urllib2, 'urlopen')
-        urllib2.urlopen(url).AndReturn(cStringIO.StringIO(data))
+        self.m.StubOutWithMock(urllib.request, 'urlopen')
+        urllib.request.urlopen(url).AndReturn(cStringIO(data))
         self.m.ReplayAll()
 
         self.assertEqual(data, urlfetch.get(url, allowed_schemes=['file']))
@@ -61,11 +60,12 @@ class UrlFetchTest(HeatTestCase):
     def test_file_scheme_failure(self):
         url = 'file:///etc/profile'
 
-        self.m.StubOutWithMock(urllib2, 'urlopen')
-        urllib2.urlopen(url).AndRaise(urllib2.URLError('oops'))
+        self.m.StubOutWithMock(urllib.request, 'urlopen')
+        urllib.request.urlopen(url).AndRaise(urllib.error.URLError('oops'))
         self.m.ReplayAll()
 
-        self.assertRaises(IOError, urlfetch.get, url, allowed_schemes=['file'])
+        self.assertRaises(urlfetch.URLFetchError,
+                          urlfetch.get, url, allowed_schemes=['file'])
         self.m.VerifyAll()
 
     def test_http_scheme(self):
@@ -74,7 +74,7 @@ class UrlFetchTest(HeatTestCase):
         response = Response(data)
         requests.get(url, stream=True).AndReturn(response)
         self.m.ReplayAll()
-        self.assertEqual(urlfetch.get(url), data)
+        self.assertEqual(data, urlfetch.get(url))
         self.m.VerifyAll()
 
     def test_https_scheme(self):
@@ -83,7 +83,7 @@ class UrlFetchTest(HeatTestCase):
         response = Response(data)
         requests.get(url, stream=True).AndReturn(response)
         self.m.ReplayAll()
-        self.assertEqual(urlfetch.get(url), data)
+        self.assertEqual(data, urlfetch.get(url))
         self.m.VerifyAll()
 
     def test_http_error(self):
@@ -92,7 +92,7 @@ class UrlFetchTest(HeatTestCase):
         requests.get(url, stream=True).AndRaise(exceptions.HTTPError())
         self.m.ReplayAll()
 
-        self.assertRaises(IOError, urlfetch.get, url)
+        self.assertRaises(urlfetch.URLFetchError, urlfetch.get, url)
         self.m.VerifyAll()
 
     def test_non_exist_url(self):
@@ -101,12 +101,12 @@ class UrlFetchTest(HeatTestCase):
         requests.get(url, stream=True).AndRaise(exceptions.Timeout())
         self.m.ReplayAll()
 
-        self.assertRaises(IOError, urlfetch.get, url)
+        self.assertRaises(urlfetch.URLFetchError, urlfetch.get, url)
         self.m.VerifyAll()
 
     def test_garbage(self):
         self.m.ReplayAll()
-        self.assertRaises(IOError, urlfetch.get, 'wibble')
+        self.assertRaises(urlfetch.URLFetchError, urlfetch.get, 'wibble')
         self.m.VerifyAll()
 
     def test_max_fetch_size_okay(self):
@@ -126,6 +126,7 @@ class UrlFetchTest(HeatTestCase):
         cfg.CONF.set_override('max_template_size', 5)
         requests.get(url, stream=True).AndReturn(response)
         self.m.ReplayAll()
-        exception = self.assertRaises(IOError, urlfetch.get, url)
-        self.assertTrue("Template exceeds" in str(exception))
+        exception = self.assertRaises(urlfetch.URLFetchError,
+                                      urlfetch.get, url)
+        self.assertIn("Template exceeds", six.text_type(exception))
         self.m.VerifyAll()

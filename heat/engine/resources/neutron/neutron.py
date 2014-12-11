@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,17 +11,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from neutronclient.common.exceptions import NeutronClientException
+import warnings
 
 from heat.common import exception
 from heat.engine import resource
-
+from heat.engine import scheduler
 from heat.openstack.common import log as logging
+from heat.openstack.common import uuidutils
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 class NeutronResource(resource.Resource):
+
+    default_client_name = 'neutron'
 
     def validate(self):
         '''
@@ -51,10 +52,25 @@ class NeutronResource(resource.Resource):
                 return '%s not allowed in value_specs' % k
 
     @staticmethod
+    def _validate_depr_property_required(properties, prop_key, depr_prop_key):
+            prop_value = properties.get(prop_key)
+            depr_prop_value = properties.get(depr_prop_key)
+
+            if prop_value and depr_prop_value:
+                raise exception.ResourcePropertyConflict(prop_key,
+                                                         depr_prop_key)
+            if not prop_value and not depr_prop_value:
+                msg = _('Either %(prop_key)s or %(depr_prop_key)s'
+                        ' should be specified.'
+                        ) % {'prop_key': prop_key,
+                             'depr_prop_key': depr_prop_key}
+                raise exception.StackValidationFailed(message=msg)
+
+    @staticmethod
     def prepare_properties(properties, name):
         '''
         Prepares the property values so that they can be passed directly to
-        the Neutron call.
+        the Neutron create call.
 
         Removes None values and value_specs, merges value_specs with the main
         values.
@@ -70,80 +86,105 @@ class NeutronResource(resource.Resource):
 
         return props
 
-    @staticmethod
-    def handle_get_attributes(name, key, attributes):
+    def prepare_update_properties(self, definition):
         '''
-        Support method for responding to FnGetAtt
+        Prepares the property values so that they can be passed directly to
+        the Neutron update call.
+
+        Removes any properties which are not update_allowed, then processes
+        as for prepare_properties.
         '''
-        if key == 'show':
-            return attributes
+        p = definition.properties(self.properties_schema, self.context)
+        update_props = dict((k, v) for k, v in p.items()
+                            if p.props.get(k).schema.update_allowed)
 
-        if key in attributes.keys():
-            return attributes[key]
-
-        raise exception.InvalidTemplateAttribute(resource=name, key=key)
+        props = self.prepare_properties(
+            update_props,
+            self.physical_resource_name())
+        return props
 
     @staticmethod
     def is_built(attributes):
-        if attributes['status'] == 'BUILD':
+        status = attributes['status']
+        if status == 'BUILD':
             return False
-        if attributes['status'] in ('ACTIVE', 'DOWN'):
+        if status in ('ACTIVE', 'DOWN'):
             return True
+        elif status == 'ERROR':
+            raise resource.ResourceInError(
+                resource_status=status)
         else:
-            raise exception.Error('%s resource[%s] status[%s]' %
-                                  ('neutron reported unexpected',
-                                   attributes['name'], attributes['status']))
+            raise resource.ResourceUnknownStatus(
+                resource_status=status,
+                result=_('Resource is not built'))
 
     def _resolve_attribute(self, name):
         try:
             attributes = self._show_resource()
-        except NeutronClientException as ex:
-            logger.warn("failed to fetch resource attributes: %s" % str(ex))
+        except Exception as ex:
+            self.client_plugin().ignore_not_found(ex)
             return None
-        return self.handle_get_attributes(self.name, name, attributes)
+        if name == 'show':
+            return attributes
+
+        return attributes[name]
 
     def _confirm_delete(self):
         while True:
             try:
                 yield
                 self._show_resource()
-            except NeutronClientException as ex:
-                self._handle_not_found_exception(ex)
+            except Exception as ex:
+                self.client_plugin().ignore_not_found(ex)
                 return
-
-    def _handle_not_found_exception(self, ex):
-        if ex.status_code != 404:
-            raise ex
 
     def FnGetRefId(self):
         return unicode(self.resource_id)
 
     @staticmethod
-    def get_secgroup_uuids(stack, props, props_name, rsrc_name, client):
+    def get_secgroup_uuids(security_groups, client, tenant_id):
         '''
-        Returns security group names in UUID form.
-
+        Returns a list of security group UUIDs.
         Args:
-            stack: stack associated with given resource
-            props: properties described in the template
-            props_name: name of security group property
-            rsrc_name: name of the given resource
+            security_groups: List of security group names or UUIDs
             client: reference to neutronclient
+            tenant_id: the tenant id to match the security_groups
         '''
+        warnings.warn('neutron.NeutronResource.get_secgroup_uuids is '
+                      'deprecated. Use '
+                      'self.client_plugin("neutron").get_secgroup_uuids')
         seclist = []
-        for sg in props.get(props_name):
-            resource = stack.resource_by_refid(sg)
-            if resource is not None:
-                seclist.append(resource.resource_id)
+        all_groups = None
+        for sg in security_groups:
+            if uuidutils.is_uuid_like(sg):
+                seclist.append(sg)
             else:
-                try:
-                    client.show_security_group(sg)
-                    seclist.append(sg)
-                except NeutronClientException as e:
-                    if e.status_code == 404:
-                        raise exception.InvalidTemplateAttribute(
-                            resource=rsrc_name,
-                            key=props_name)
+                if not all_groups:
+                    response = client.list_security_groups()
+                    all_groups = response['security_groups']
+                same_name_groups = [g for g in all_groups if g['name'] == sg]
+                groups = [g['id'] for g in same_name_groups]
+                if len(groups) == 0:
+                    raise exception.PhysicalResourceNotFound(resource_id=sg)
+                elif len(groups) == 1:
+                    seclist.append(groups[0])
+                else:
+                    # for admin roles, can get the other users'
+                    # securityGroups, so we should match the tenant_id with
+                    # the groups, and return the own one
+                    own_groups = [g['id'] for g in same_name_groups
+                                  if g['tenant_id'] == tenant_id]
+                    if len(own_groups) == 1:
+                        seclist.append(own_groups[0])
                     else:
-                        raise
+                        raise exception.PhysicalResourceNameAmbiguity(name=sg)
         return seclist
+
+    def _delete_task(self):
+        delete_task = scheduler.TaskRunner(self._confirm_delete)
+        delete_task.start()
+        return delete_task
+
+    def check_delete_complete(self, delete_task):
+        # if the resource was already deleted, delete_task will be None
+        return delete_task is None or delete_task.step()

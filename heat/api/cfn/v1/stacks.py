@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -22,19 +20,19 @@ import socket
 
 from heat.api.aws import exception
 from heat.api.aws import utils as api_utils
-from heat.common import wsgi
 from heat.common import exception as heat_exception
-from heat.rpc import client as rpc_client
-from heat.common import template_format
-from heat.rpc import api as engine_api
+from heat.common.i18n import _
+from heat.common.i18n import _LI
 from heat.common import identifier
-from heat.common import urlfetch
 from heat.common import policy
-
+from heat.common import template_format
+from heat.common import urlfetch
+from heat.common import wsgi
 from heat.openstack.common import log as logging
-from heat.openstack.common.gettextutils import _
+from heat.rpc import api as engine_api
+from heat.rpc import client as rpc_client
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 class StackController(object):
@@ -46,17 +44,17 @@ class StackController(object):
 
     def __init__(self, options):
         self.options = options
-        self.engine_rpcapi = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
         self.policy = policy.Enforcer(scope='cloudformation')
 
     def _enforce(self, req, action):
         """Authorize an action against the policy.json."""
         try:
-            self.policy.enforce(req.context, action, {})
+            self.policy.enforce(req.context, action)
         except heat_exception.Forbidden:
             msg = _('Action %s not allowed for user') % action
             raise exception.HeatAccessDeniedError(msg)
-        except Exception as ex:
+        except Exception:
             # We expect policy.enforce to either pass or raise Forbidden
             # however, if anything else happens, we want to raise
             # HeatInternalFailureError, failure to do this results in
@@ -104,7 +102,7 @@ class StackController(object):
         try:
             return dict(identifier.HeatIdentifier.from_arn(stack_name))
         except ValueError:
-            return self.engine_rpcapi.identify_stack(con, stack_name)
+            return self.rpc_client.identify_stack(con, stack_name)
 
     def list(self, req):
         """
@@ -133,7 +131,7 @@ class StackController(object):
             status = s[engine_api.STACK_STATUS]
             result['StackStatus'] = '_'.join((action, status))
 
-            # AWS docs indicate DeletionTime is ommitted for current stacks
+            # AWS docs indicate DeletionTime is omitted for current stacks
             # This is still TODO(unknown) in the engine, we don't keep data for
             # stacks after they are deleted
             if engine_api.STACK_DELETION_TIME in s:
@@ -143,7 +141,7 @@ class StackController(object):
 
         con = req.context
         try:
-            stack_list = self.engine_rpcapi.list_stacks(con)
+            stack_list = self.rpc_client.list_stacks(con)
         except Exception as ex:
             return exception.map_remote_error(ex)
 
@@ -191,7 +189,6 @@ class StackController(object):
                 engine_api.STACK_CREATION_TIME: 'CreationTime',
                 engine_api.STACK_DESCRIPTION: 'Description',
                 engine_api.STACK_DISABLE_ROLLBACK: 'DisableRollback',
-                engine_api.STACK_UPDATED_TIME: 'LastUpdatedTime',
                 engine_api.STACK_NOTIFICATION_TOPICS: 'NotificationARNs',
                 engine_api.STACK_PARAMETERS: 'Parameters',
                 engine_api.STACK_ID: 'StackId',
@@ -199,6 +196,9 @@ class StackController(object):
                 engine_api.STACK_STATUS_DATA: 'StackStatusReason',
                 engine_api.STACK_TIMEOUT: 'TimeoutInMinutes',
             }
+
+            if s[engine_api.STACK_UPDATED_TIME] is not None:
+                keymap[engine_api.STACK_UPDATED_TIME] = 'LastUpdatedTime'
 
             result = api_utils.reformat_dict_keys(keymap, s)
 
@@ -233,7 +233,7 @@ class StackController(object):
             else:
                 identity = None
 
-            stack_list = self.engine_rpcapi.show_stack(con, identity)
+            stack_list = self.rpc_client.show_stack(con, identity)
 
         except Exception as ex:
             return exception.map_remote_error(ex)
@@ -247,15 +247,15 @@ class StackController(object):
         Get template file contents, either from local file or URL
         """
         if 'TemplateBody' in req.params:
-            logger.debug('TemplateBody ...')
+            LOG.debug('TemplateBody ...')
             return req.params['TemplateBody']
         elif 'TemplateUrl' in req.params:
             url = req.params['TemplateUrl']
-            logger.debug('TemplateUrl %s' % url)
+            LOG.debug('TemplateUrl %s' % url)
             try:
                 return urlfetch.get(url)
             except IOError as exc:
-                msg = _('Failed to fetch template: %s') % str(exc)
+                msg = _('Failed to fetch template: %s') % exc
                 raise exception.HeatInvalidParameterValueError(detail=msg)
 
         return None
@@ -267,9 +267,11 @@ class StackController(object):
     )
 
     def create(self, req):
+        self._enforce(req, 'CreateStack')
         return self.create_or_update(req, self.CREATE_STACK)
 
     def update(self, req):
+        self._enforce(req, 'UpdateStack')
         return self.create_or_update(req, self.UPDATE_STACK)
 
     def create_or_update(self, req, action=None):
@@ -312,8 +314,8 @@ class StackController(object):
             # This should not happen, so return HeatInternalFailureError
             return exception.HeatInternalFailureError(detail=msg)
 
-        engine_action = {self.CREATE_STACK: self.engine_rpcapi.create_stack,
-                         self.UPDATE_STACK: self.engine_rpcapi.update_stack}
+        engine_action = {self.CREATE_STACK: self.rpc_client.create_stack,
+                         self.UPDATE_STACK: self.rpc_client.update_stack}
 
         con = req.context
 
@@ -363,6 +365,20 @@ class StackController(object):
 
         return api_utils.format_response(action, response)
 
+    def cancel_update(self, req):
+        action = 'CancelUpdateStack'
+        self._enforce(req, action)
+        con = req.context
+        stack_name = req.params['StackName']
+        stack_identity = self._get_identity(con, stack_name)
+        try:
+            self.rpc_client.stack_cancel_update(
+                con, stack_identity=stack_identity)
+        except Exception as ex:
+            return exception.map_remote_error(ex)
+
+        return api_utils.format_response(action, {})
+
     def get_template(self, req):
         """
         Implements the GetTemplate API action.
@@ -373,7 +389,7 @@ class StackController(object):
         con = req.context
         try:
             identity = self._get_identity(con, req.params['StackName'])
-            templ = self.engine_rpcapi.get_template(con, identity)
+            templ = self.rpc_client.get_template(con, identity)
         except Exception as ex:
             return exception.map_remote_error(ex)
 
@@ -420,7 +436,7 @@ class StackController(object):
             msg = _("The Template must be a JSON or YAML document.")
             return exception.HeatInvalidParameterValueError(detail=msg)
 
-        logger.info('validate_template')
+        LOG.info(_LI('validate_template'))
 
         def format_validate_parameter(key, value):
             """
@@ -435,7 +451,7 @@ class StackController(object):
             }
 
         try:
-            res = self.engine_rpcapi.validate_template(con, template)
+            res = self.rpc_client.validate_template(con, template)
             if 'Error' in res:
                 return api_utils.format_response('ValidateTemplate',
                                                  res['Error'])
@@ -456,7 +472,7 @@ class StackController(object):
         con = req.context
         try:
             identity = self._get_identity(con, req.params['StackName'])
-            res = self.engine_rpcapi.delete_stack(con, identity, cast=False)
+            res = self.rpc_client.delete_stack(con, identity, cast=False)
 
         except Exception as ex:
             return exception.map_remote_error(ex)
@@ -499,10 +515,10 @@ class StackController(object):
             return self._id_format(result)
 
         con = req.context
-        stack_name = req.params.get('StackName', None)
+        stack_name = req.params.get('StackName')
         try:
             identity = stack_name and self._get_identity(con, stack_name)
-            events = self.engine_rpcapi.list_events(con, identity)
+            events = self.rpc_client.list_events(con, identity)
         except Exception as ex:
             return exception.map_remote_error(ex)
 
@@ -548,7 +564,7 @@ class StackController(object):
 
         try:
             identity = self._get_identity(con, req.params['StackName'])
-            resource_details = self.engine_rpcapi.describe_stack_resource(
+            resource_details = self.rpc_client.describe_stack_resource(
                 con,
                 stack_identity=identity,
                 resource_name=req.params.get('LogicalResourceId'))
@@ -612,10 +628,10 @@ class StackController(object):
             if stack_name is not None:
                 identity = self._get_identity(con, stack_name)
             else:
-                identity = self.engine_rpcapi.find_physical_resource(
+                identity = self.rpc_client.find_physical_resource(
                     con,
                     physical_resource_id=physical_resource_id)
-            resources = self.engine_rpcapi.describe_stack_resources(
+            resources = self.rpc_client.describe_stack_resources(
                 con,
                 stack_identity=identity,
                 resource_name=req.params.get('LogicalResourceId'))
@@ -657,7 +673,7 @@ class StackController(object):
 
         try:
             identity = self._get_identity(con, req.params['StackName'])
-            resources = self.engine_rpcapi.list_stack_resources(
+            resources = self.rpc_client.list_stack_resources(
                 con,
                 stack_identity=identity)
         except Exception as ex:

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,13 +11,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from heat.openstack.common import gettextutils
-
-gettextutils.install('heat')
-
-
-from heat.api.middleware.version_negotiation import VersionNegotiationFilter
 from heat.api.cfn import versions
+from heat.api.middleware.version_negotiation import VersionNegotiationFilter
 
 
 def version_negotiation_filter(app, conf, **local_conf):

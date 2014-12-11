@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,18 +11,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import eventlet
 import functools
 import itertools
 import sys
-import types
 from time import time as wallclock
+import types
 
-from heat.openstack.common import excutils
+import eventlet
+from oslo.utils import excutils
+import six
+
+from heat.common.i18n import _
 from heat.openstack.common import log as logging
-from heat.openstack.common.gettextutils import _
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 # Whether TaskRunner._sleep actually does an eventlet sleep when called.
@@ -53,7 +53,7 @@ class Timeout(BaseException):
 
     This allows the task to perform any necessary cleanup, as well as use a
     different exception to notify the controlling task if appropriate. If the
-    task supresses the exception altogether, it will be cancelled but the
+    task suppresses the exception altogether, it will be cancelled but the
     controlling task will not be notified of the timeout.
     """
 
@@ -61,7 +61,7 @@ class Timeout(BaseException):
         """
         Initialise with the TaskRunner and a timeout period in seconds.
         """
-        message = _('%s Timed out') % task_runner
+        message = _('%s Timed out') % str(task_runner)
         super(Timeout, self).__init__(message)
 
         # Note that we don't attempt to handle leap seconds or large clock
@@ -73,6 +73,53 @@ class Timeout(BaseException):
 
     def expired(self):
         return wallclock() > self._endtime
+
+    def trigger(self, generator):
+        """Trigger the timeout on a given generator."""
+        try:
+            generator.throw(self)
+        except StopIteration:
+            return True
+        else:
+            # Clean up in case task swallows exception without exiting
+            generator.close()
+            return False
+
+    def __cmp__(self, other):
+        if not isinstance(other, Timeout):
+            return NotImplemented
+        return cmp(self._endtime, other._endtime)
+
+
+class TimedCancel(Timeout):
+    def trigger(self, generator):
+        """Trigger the timeout on a given generator."""
+        generator.close()
+        return False
+
+
+class ExceptionGroup(Exception):
+    '''
+    Container for multiple exceptions.
+
+    This exception is used by DependencyTaskGroup when the flag
+    aggregate_exceptions is set to True and it's re-raised again when all tasks
+    are finished.  This way it can be caught later on so that the individual
+    exceptions can be acted upon.
+    '''
+
+    def __init__(self, exceptions=None):
+        if exceptions is None:
+            exceptions = list()
+
+        self.exceptions = list(exceptions)
+
+    def __str__(self):
+        return unicode([unicode(ex).encode('utf-8')
+                        for ex in self.exceptions]).encode('utf-8')
+
+    def __unicode__(self):
+        return unicode(map(unicode, self.exceptions))
 
 
 class TaskRunner(object):
@@ -105,7 +152,7 @@ class TaskRunner(object):
     def _sleep(self, wait_time):
         """Sleep for the specified number of seconds."""
         if ENABLE_SLEEP and wait_time is not None:
-            logger.debug('%s sleeping' % str(self))
+            LOG.debug('%s sleeping' % str(self))
             eventlet.sleep(wait_time)
 
     def __call__(self, wait_time=1, timeout=None):
@@ -116,6 +163,9 @@ class TaskRunner(object):
         sleeping, pass `None` for `wait_time`.
         """
         self.start(timeout=timeout)
+        # ensure that wait is applied only if task has not completed.
+        if not self.done():
+            self._sleep(wait_time)
         self.run_to_completion(wait_time=wait_time)
 
     def start(self, timeout=None):
@@ -127,8 +177,9 @@ class TaskRunner(object):
         raised inside the task.
         """
         assert self._runner is None, "Task already started"
+        assert not self._done, "Task already cancelled"
 
-        logger.debug('%s starting' % str(self))
+        LOG.debug('%s starting' % str(self))
 
         if timeout is not None:
             self._timeout = Timeout(self, timeout)
@@ -140,7 +191,7 @@ class TaskRunner(object):
         else:
             self._runner = False
             self._done = True
-            logger.debug('%s done (not resumable)' % str(self))
+            LOG.debug('%s done (not resumable)' % str(self))
 
     def step(self):
         """
@@ -151,23 +202,18 @@ class TaskRunner(object):
             assert self._runner is not None, "Task not started"
 
             if self._timeout is not None and self._timeout.expired():
-                logger.info('%s timed out' % str(self))
+                LOG.info(_('%s timed out') % str(self))
+                self._done = True
 
-                try:
-                    self._runner.throw(self._timeout)
-                except StopIteration:
-                    self._done = True
-                else:
-                    # Clean up in case task swallows exception without exiting
-                    self.cancel()
+                self._timeout.trigger(self._runner)
             else:
-                logger.debug('%s running' % str(self))
+                LOG.debug('%s running' % str(self))
 
                 try:
                     next(self._runner)
                 except StopIteration:
                     self._done = True
-                    logger.debug('%s complete' % str(self))
+                    LOG.debug('%s complete' % str(self))
 
         return self._done
 
@@ -181,12 +227,20 @@ class TaskRunner(object):
         while not self.step():
             self._sleep(wait_time)
 
-    def cancel(self):
-        """Cancel the task if it is running."""
-        if self.started() and not self.done():
-            logger.debug('%s cancelled' % str(self))
-            self._runner.close()
+    def cancel(self, grace_period=None):
+        """Cancel the task and mark it as done."""
+        if self.done():
+            return
+
+        if not self.started() or grace_period is None:
+            LOG.debug('%s cancelled' % str(self))
             self._done = True
+            if self.started():
+                self._runner.close()
+        else:
+            timeout = TimedCancel(self, grace_period)
+            if self._timeout is None or timeout < self._timeout:
+                self._timeout = timeout
 
     def started(self):
         """Return True if the task has been started."""
@@ -236,10 +290,10 @@ def wrappertask(task):
                     while subtask_running:
                         try:
                             yield step
-                        except GeneratorExit as exit:
+                        except GeneratorExit as ex:
                             subtask.close()
-                            raise exit
-                        except:
+                            raise ex
+                        except:  # noqa
                             try:
                                 step = subtask.throw(*sys.exc_info())
                             except StopIteration:
@@ -251,10 +305,10 @@ def wrappertask(task):
                                 subtask_running = False
                 else:
                     yield
-            except GeneratorExit as exit:
+            except GeneratorExit as ex:
                 parent.close()
-                raise exit
-            except:
+                raise ex
+            except:  # noqa
                 subtask = parent.throw(*sys.exc_info())
             else:
                 subtask = next(parent)
@@ -268,7 +322,8 @@ class DependencyTaskGroup(object):
     """
 
     def __init__(self, dependencies, task=lambda o: o(),
-                 reverse=False, name=None):
+                 reverse=False, name=None, error_wait_time=None,
+                 aggregate_exceptions=False):
         """
         Initialise with the task dependencies and (optionally) a task to run on
         each.
@@ -276,9 +331,21 @@ class DependencyTaskGroup(object):
         If no task is supplied, it is assumed that the tasks are stored
         directly in the dependency tree. If a task is supplied, the object
         stored in the dependency tree is passed as an argument.
+
+        If an error_wait_time is specified, tasks that are already running at
+        the time of an error will continue to run for up to the specified
+        time before being cancelled. Once all remaining tasks are complete or
+        have been cancelled, the original exception is raised.
+
+        If aggregate_exceptions is True, then execution of parallel operations
+        will not be cancelled in the event of an error (operations downstream
+        of the error will be cancelled). Once all chains are complete, any
+        errors will be rolled up into an ExceptionGroup exception.
         """
         self._runners = dict((o, TaskRunner(task, o)) for o in dependencies)
         self._graph = dependencies.graph(reverse=reverse)
+        self.error_wait_time = error_wait_time
+        self.aggregate_exceptions = aggregate_exceptions
 
         if name is None:
             name = '(%s) %s' % (getattr(task, '__name__',
@@ -292,8 +359,9 @@ class DependencyTaskGroup(object):
 
     def __call__(self):
         """Return a co-routine which runs the task group."""
-        try:
-            while any(self._runners.itervalues()):
+        raised_exceptions = []
+        while any(self._runners.itervalues()):
+            try:
                 for k, r in self._ready():
                     r.start()
 
@@ -302,20 +370,46 @@ class DependencyTaskGroup(object):
                 for k, r in self._running():
                     if r.step():
                         del self._graph[k]
-        except:
-            with excutils.save_and_reraise_exception():
-                for r in self._runners.itervalues():
-                    r.cancel()
+            except Exception:
+                exc_info = sys.exc_info()
+                if self.aggregate_exceptions:
+                    self._cancel_recursively(k, r)
+                else:
+                    self.cancel_all(grace_period=self.error_wait_time)
+                raised_exceptions.append(exc_info)
+            except:  # noqa
+                with excutils.save_and_reraise_exception():
+                    self.cancel_all()
+
+        if raised_exceptions:
+            if self.aggregate_exceptions:
+                raise ExceptionGroup(v for t, v, tb in raised_exceptions)
+            else:
+                exc_type, exc_val, traceback = raised_exceptions[0]
+                raise exc_type, exc_val, traceback
+
+    def cancel_all(self, grace_period=None):
+        for r in self._runners.itervalues():
+            r.cancel(grace_period=grace_period)
+
+    def _cancel_recursively(self, key, runner):
+        runner.cancel()
+        node = self._graph[key]
+        for dependent_node in node.required_by():
+            node_runner = self._runners[dependent_node]
+            self._cancel_recursively(dependent_node, node_runner)
+
+        del self._graph[key]
 
     def _ready(self):
         """
         Iterate over all subtasks that are ready to start - i.e. all their
         dependencies have been satisfied but they have not yet been started.
         """
-        for k, n in self._graph.iteritems():
+        for k, n in six.iteritems(self._graph):
             if not n:
                 runner = self._runners[k]
-                if not runner.started():
+                if runner and not runner.started():
                     yield k, runner
 
     def _running(self):
@@ -324,7 +418,7 @@ class DependencyTaskGroup(object):
         been started but have not yet completed.
         """
         running = lambda (k, r): k in self._graph and r.started()
-        return itertools.ifilter(running, self._runners.iteritems())
+        return itertools.ifilter(running, six.iteritems(self._runners))
 
 
 class PollingTaskGroup(object):
@@ -356,7 +450,7 @@ class PollingTaskGroup(object):
         """Return a list containing the keyword args for each subtask."""
         keygroups = (itertools.izip(itertools.repeat(name),
                                     arglist)
-                     for name, arglist in kwarg_lists.iteritems())
+                     for name, arglist in six.iteritems(kwarg_lists))
         return [dict(kwargs) for kwargs in itertools.izip(*keygroups)]
 
     @classmethod
@@ -416,7 +510,7 @@ class PollingTaskGroup(object):
                 yield
                 runners = list(itertools.dropwhile(lambda r: r.step(),
                                                    runners))
-        except:
+        except:  # noqa
             with excutils.save_and_reraise_exception():
                 for r in runners:
                     r.cancel()

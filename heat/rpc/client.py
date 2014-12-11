@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # Copyright 2012, Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,25 +17,45 @@
 Client side of the heat engine RPC API.
 """
 
+from heat.common import messaging
 from heat.rpc import api
 
-import heat.openstack.common.rpc.proxy
 
-
-class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
+class EngineClient(object):
     '''Client side of the heat engine rpc API.
 
     API version history::
 
         1.0 - Initial version.
+        1.1 - Add support_status argument to list_resource_types()
     '''
 
     BASE_RPC_API_VERSION = '1.0'
 
     def __init__(self):
-        super(EngineClient, self).__init__(
+        self._client = messaging.get_rpc_client(
             topic=api.ENGINE_TOPIC,
-            default_version=self.BASE_RPC_API_VERSION)
+            version=self.BASE_RPC_API_VERSION)
+
+    @staticmethod
+    def make_msg(method, **kwargs):
+        return method, kwargs
+
+    def call(self, ctxt, msg, version=None):
+        method, kwargs = msg
+        if version is not None:
+            client = self._client.prepare(version=version)
+        else:
+            client = self._client
+        return client.call(ctxt, method, **kwargs)
+
+    def cast(self, ctxt, msg, version=None):
+        method, kwargs = msg
+        if version is not None:
+            client = self._client.prepare(version=version)
+        else:
+            client = self._client
+        return client.cast(ctxt, method, **kwargs)
 
     def identify_stack(self, ctxt, stack_name):
         """
@@ -50,13 +69,49 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
         return self.call(ctxt, self.make_msg('identify_stack',
                                              stack_name=stack_name))
 
-    def list_stacks(self, ctxt):
+    def list_stacks(self, ctxt, limit=None, marker=None, sort_keys=None,
+                    sort_dir=None, filters=None, tenant_safe=True,
+                    show_deleted=False, show_nested=False):
         """
-        The list_stacks method returns the attributes of all stacks.
+        The list_stacks method returns attributes of all stacks.  It supports
+        pagination (``limit`` and ``marker``), sorting (``sort_keys`` and
+        ``sort_dir``) and filtering (``filters``) of the results.
 
         :param ctxt: RPC context.
+        :param limit: the number of stacks to list (integer or string)
+        :param marker: the ID of the last item in the previous page
+        :param sort_keys: an array of fields used to sort the list
+        :param sort_dir: the direction of the sort ('asc' or 'desc')
+        :param filters: a dict with attribute:value to filter the list
+        :param tenant_safe: if true, scope the request by the current tenant
+        :param show_deleted: if true, show soft-deleted stacks
+        :param show_nested: if true, show nested stacks
+        :returns: a list of stacks
         """
-        return self.call(ctxt, self.make_msg('list_stacks'))
+        return self.call(ctxt,
+                         self.make_msg('list_stacks', limit=limit,
+                                       sort_keys=sort_keys, marker=marker,
+                                       sort_dir=sort_dir, filters=filters,
+                                       tenant_safe=tenant_safe,
+                                       show_deleted=show_deleted,
+                                       show_nested=show_nested))
+
+    def count_stacks(self, ctxt, filters=None, tenant_safe=True,
+                     show_deleted=False, show_nested=False):
+        """
+        Return the number of stacks that match the given filters
+        :param ctxt: RPC context.
+        :param filters: a dict of ATTR:VALUE to match against stacks
+        :param tenant_safe: if true, scope the request by the current tenant
+        :param show_deleted: if true, count will include the deleted stacks
+        :param show_nested: if true, count will include nested stacks
+        :returns: a integer representing the number of matched stacks
+        """
+        return self.call(ctxt, self.make_msg('count_stacks',
+                                             filters=filters,
+                                             tenant_safe=tenant_safe,
+                                             show_deleted=show_deleted,
+                                             show_nested=show_nested))
 
     def show_stack(self, ctxt, stack_identity):
         """
@@ -67,6 +122,25 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
         """
         return self.call(ctxt, self.make_msg('show_stack',
                                              stack_identity=stack_identity))
+
+    def preview_stack(self, ctxt, stack_name, template, params, files, args):
+        """
+        Simulates a new stack using the provided template.
+
+        Note that at this stage the template has already been fetched from the
+        heat-api process if using a template-url.
+
+        :param ctxt: RPC context.
+        :param stack_name: Name of the stack you want to create.
+        :param template: Template of stack you want to create.
+        :param params: Stack Input Params/Environment
+        :param files: files referenced from the environment.
+        :param args: Request parameters/args passed from API
+        """
+        return self.call(ctxt,
+                         self.make_msg('preview_stack', stack_name=stack_name,
+                                       template=template,
+                                       params=params, files=files, args=args))
 
     def create_stack(self, ctxt, stack_name, template, params, files, args):
         """
@@ -82,10 +156,22 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
         :param files: files referenced from the environment.
         :param args: Request parameters/args passed from API
         """
+        return self._create_stack(ctxt, stack_name, template, params, files,
+                                  args)
+
+    def _create_stack(self, ctxt, stack_name, template, params, files, args,
+                      owner_id=None):
+        """
+        Internal create_stack interface for engine-to-engine communication via
+        RPC.  Allows some additional options which should not be exposed to
+        users via the API:
+        :param owner_id: parent stack ID for nested stacks
+        """
         return self.call(ctxt,
                          self.make_msg('create_stack', stack_name=stack_name,
                                        template=template,
-                                       params=params, files=files, args=args))
+                                       params=params, files=files, args=args,
+                                       owner_id=owner_id))
 
     def update_stack(self, ctxt, stack_identity, template, params,
                      files, args):
@@ -109,16 +195,18 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
                                              files=files,
                                              args=args))
 
-    def validate_template(self, ctxt, template):
+    def validate_template(self, ctxt, template, params=None):
         """
         The validate_template method uses the stack parser to check
         the validity of a template.
 
         :param ctxt: RPC context.
         :param template: Template of stack you want to create.
+        :param params: Stack Input Params/Environment
         """
         return self.call(ctxt, self.make_msg('validate_template',
-                                             template=template))
+                                             template=template,
+                                             params=params))
 
     def authenticated_to_backend(self, ctxt):
         """
@@ -152,13 +240,27 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
                           self.make_msg('delete_stack',
                                         stack_identity=stack_identity))
 
-    def list_resource_types(self, ctxt):
+    def abandon_stack(self, ctxt, stack_identity):
+        """
+        The abandon_stack method deletes a given stack but
+        resources would not be deleted.
+
+        :param ctxt: RPC context.
+        :param stack_identity: Name of the stack you want to abandon.
+        """
+        return self.call(ctxt,
+                         self.make_msg('abandon_stack',
+                                       stack_identity=stack_identity))
+
+    def list_resource_types(self, ctxt, support_status=None):
         """
         Get a list of valid resource types.
 
         :param ctxt: RPC context.
         """
-        return self.call(ctxt, self.make_msg('list_resource_types'))
+        return self.call(ctxt, self.make_msg('list_resource_types',
+                                             support_status=support_status),
+                         version='1.1')
 
     def resource_schema(self, ctxt, type_name):
         """
@@ -179,15 +281,29 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
         return self.call(ctxt, self.make_msg('generate_template',
                                              type_name=type_name))
 
-    def list_events(self, ctxt, stack_identity):
+    def list_events(self, ctxt, stack_identity, filters=None, limit=None,
+                    marker=None, sort_keys=None, sort_dir=None,):
         """
         The list_events method lists all events associated with a given stack.
+        It supports pagination (``limit`` and ``marker``),
+        sorting (``sort_keys`` and ``sort_dir``) and filtering(filters)
+        of the results.
 
         :param ctxt: RPC context.
-        :param stack_identity: Name of the stack you want to get events for.
+        :param stack_identity: Name of the stack you want to get events for
+        :param filters: a dict with attribute:value to filter the list
+        :param limit: the number of events to list (integer or string)
+        :param marker: the ID of the last event in the previous page
+        :param sort_keys: an array of fields used to sort the list
+        :param sort_dir: the direction of the sort ('asc' or 'desc').
         """
         return self.call(ctxt, self.make_msg('list_events',
-                                             stack_identity=stack_identity))
+                                             stack_identity=stack_identity,
+                                             filters=filters,
+                                             limit=limit,
+                                             marker=marker,
+                                             sort_keys=sort_keys,
+                                             sort_dir=sort_dir))
 
     def describe_stack_resource(self, ctxt, stack_identity, resource_name):
         """
@@ -223,14 +339,16 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
                                              stack_identity=stack_identity,
                                              resource_name=resource_name))
 
-    def list_stack_resources(self, ctxt, stack_identity):
+    def list_stack_resources(self, ctxt, stack_identity, nested_depth=0):
         """
         List the resources belonging to a stack.
         :param ctxt: RPC context.
         :param stack_identity: Name of the stack.
+        :param nested_depth: Levels of nested stacks of which list resources.
         """
         return self.call(ctxt, self.make_msg('list_stack_resources',
-                                             stack_identity=stack_identity))
+                                             stack_identity=stack_identity,
+                                             nested_depth=nested_depth))
 
     def stack_suspend(self, ctxt, stack_identity):
         return self.call(ctxt, self.make_msg('stack_suspend',
@@ -238,6 +356,14 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
 
     def stack_resume(self, ctxt, stack_identity):
         return self.call(ctxt, self.make_msg('stack_resume',
+                                             stack_identity=stack_identity))
+
+    def stack_check(self, ctxt, stack_identity):
+        return self.call(ctxt, self.make_msg('stack_check',
+                                             stack_identity=stack_identity))
+
+    def stack_cancel_update(self, ctxt, stack_identity):
+        return self.call(ctxt, self.make_msg('stack_cancel_update',
                                              stack_identity=stack_identity))
 
     def metadata_update(self, ctxt, stack_identity, resource_name, metadata):
@@ -311,3 +437,90 @@ class EngineClient(heat.openstack.common.rpc.proxy.RpcProxy):
         return self.call(ctxt, self.make_msg('set_watch_state',
                                              watch_name=watch_name,
                                              state=state))
+
+    def get_revision(self, ctxt):
+        return self.call(ctxt, self.make_msg('get_revision'))
+
+    def show_software_config(self, cnxt, config_id):
+        return self.call(cnxt, self.make_msg('show_software_config',
+                                             config_id=config_id))
+
+    def create_software_config(self, cnxt, group, name, config,
+                               inputs=None, outputs=None, options=None):
+        inputs = inputs or []
+        outputs = outputs or []
+        options = options or {}
+        return self.call(cnxt, self.make_msg('create_software_config',
+                                             group=group,
+                                             name=name,
+                                             config=config,
+                                             inputs=inputs,
+                                             outputs=outputs,
+                                             options=options))
+
+    def delete_software_config(self, cnxt, config_id):
+        return self.call(cnxt, self.make_msg('delete_software_config',
+                                             config_id=config_id))
+
+    def list_software_deployments(self, cnxt, server_id=None):
+        return self.call(cnxt, self.make_msg('list_software_deployments',
+                                             server_id=server_id))
+
+    def metadata_software_deployments(self, cnxt, server_id):
+        return self.call(cnxt, self.make_msg('metadata_software_deployments',
+                                             server_id=server_id))
+
+    def show_software_deployment(self, cnxt, deployment_id):
+        return self.call(cnxt, self.make_msg('show_software_deployment',
+                                             deployment_id=deployment_id))
+
+    def create_software_deployment(self, cnxt, server_id, config_id=None,
+                                   input_values=None, action='INIT',
+                                   status='COMPLETE', status_reason='',
+                                   stack_user_project_id=None):
+        input_values = input_values or {}
+        return self.call(cnxt, self.make_msg(
+            'create_software_deployment',
+            server_id=server_id,
+            config_id=config_id,
+            input_values=input_values,
+            action=action,
+            status=status,
+            status_reason=status_reason,
+            stack_user_project_id=stack_user_project_id))
+
+    def update_software_deployment(self, cnxt, deployment_id,
+                                   config_id=None, input_values=None,
+                                   output_values=None, action=None,
+                                   status=None, status_reason=None):
+        return self.call(cnxt, self.make_msg('update_software_deployment',
+                                             deployment_id=deployment_id,
+                                             config_id=config_id,
+                                             input_values=input_values,
+                                             output_values=output_values,
+                                             action=action,
+                                             status=status,
+                                             status_reason=status_reason))
+
+    def delete_software_deployment(self, cnxt, deployment_id):
+        return self.call(cnxt, self.make_msg('delete_software_deployment',
+                                             deployment_id=deployment_id))
+
+    def stack_snapshot(self, ctxt, stack_identity, name):
+        return self.call(ctxt, self.make_msg('stack_snapshot',
+                                             stack_identity=stack_identity,
+                                             name=name))
+
+    def show_snapshot(self, cnxt, stack_identity, snapshot_id):
+        return self.call(cnxt, self.make_msg('show_snapshot',
+                                             stack_identity=stack_identity,
+                                             snapshot_id=snapshot_id))
+
+    def delete_snapshot(self, cnxt, stack_identity, snapshot_id):
+        return self.call(cnxt, self.make_msg('delete_snapshot',
+                                             stack_identity=stack_identity,
+                                             snapshot_id=snapshot_id))
+
+    def stack_list_snapshots(self, cnxt, stack_identity):
+        return self.call(cnxt, self.make_msg('stack_list_snapshots',
+                                             stack_identity=stack_identity))

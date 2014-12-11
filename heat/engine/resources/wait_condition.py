@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,27 +12,215 @@
 #    under the License.
 
 import json
+import uuid
 
 from heat.common import exception
 from heat.common import identifier
+from heat.engine import attributes
+from heat.engine import constraints
+from heat.engine import properties
 from heat.engine import resource
 from heat.engine import scheduler
 from heat.engine import signal_responder
-
 from heat.openstack.common import log as logging
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
-class WaitConditionHandle(signal_responder.SignalResponder):
+class BaseWaitConditionHandle(signal_responder.SignalResponder):
+    '''
+    Base WaitConditionHandle resource.
+    The main point of this class is to :
+    - have no dependencies (so the instance can reference it)
+    - create credentials to allow for signalling from the instance.
+    - handle signals from the instance, validate and store result
+    '''
+    properties_schema = {}
+
+    WAIT_STATUSES = (
+        STATUS_FAILURE,
+        STATUS_SUCCESS,
+    ) = (
+        'FAILURE',
+        'SUCCESS',
+    )
+
+    def handle_create(self):
+        super(BaseWaitConditionHandle, self).handle_create()
+        self.resource_id_set(self._get_user_id())
+
+    def _status_ok(self, status):
+        return status in self.WAIT_STATUSES
+
+    def _metadata_format_ok(self, metadata):
+        if sorted(tuple(metadata.keys())) == sorted(self.METADATA_KEYS):
+            return self._status_ok(metadata[self.STATUS])
+
+    def handle_signal(self, metadata=None):
+        signal_reason = None
+        if self._metadata_format_ok(metadata):
+            rsrc_metadata = self.metadata_get(refresh=True)
+            if metadata[self.UNIQUE_ID] in rsrc_metadata:
+                LOG.warning(_("Overwriting Metadata item for id %s!")
+                            % metadata[self.UNIQUE_ID])
+            safe_metadata = {}
+            for k in self.METADATA_KEYS:
+                if k == self.UNIQUE_ID:
+                    continue
+                safe_metadata[k] = metadata[k]
+            rsrc_metadata.update({metadata[self.UNIQUE_ID]: safe_metadata})
+            self.metadata_set(rsrc_metadata)
+            signal_reason = ('status:%s reason:%s' %
+                             (safe_metadata[self.STATUS],
+                              safe_metadata[self.REASON]))
+        else:
+            LOG.error(_("Metadata failed validation for %s") % self.name)
+            raise ValueError(_("Metadata format invalid"))
+        return signal_reason
+
+    def get_status(self):
+        '''
+        Return a list of the Status values for the handle signals
+        '''
+        return [v[self.STATUS]
+                for v in self.metadata_get(refresh=True).values()]
+
+    def get_status_reason(self, status):
+        '''
+        Return a list of reasons associated with a particular status
+        '''
+        return [v[self.REASON]
+                for v in self.metadata_get(refresh=True).values()
+                if v[self.STATUS] == status]
+
+
+class HeatWaitConditionHandle(BaseWaitConditionHandle):
+    METADATA_KEYS = (
+        DATA, REASON, STATUS, UNIQUE_ID
+    ) = (
+        'data', 'reason', 'status', 'id'
+    )
+
+    ATTRIBUTES = (
+        TOKEN,
+        ENDPOINT,
+        CURL_CLI,
+    ) = (
+        'token',
+        'endpoint',
+        'curl_cli',
+    )
+
+    attributes_schema = {
+        TOKEN: attributes.Schema(
+            _('Token for stack-user which can be used for signalling handle'),
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
+        ENDPOINT: attributes.Schema(
+            _('Endpoint/url which can be used for signalling handle'),
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
+        CURL_CLI: attributes.Schema(
+            _('Convenience attribute, provides curl CLI command '
+              'prefix, which can be used for signalling handle completion or '
+              'failure.  You can signal success by adding '
+              '--data-binary \'{"status": "SUCCESS"}\' '
+              ', or signal failure by adding '
+              '--data-binary \'{"status": "FAILURE"}\''),
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
+    }
+
+    def handle_create(self):
+        password = uuid.uuid4().hex
+        self.data_set('password', password, True)
+        self._create_user()
+        self.resource_id_set(self._get_user_id())
+        # FIXME(shardy): The assumption here is that token expiry > timeout
+        # but we probably need a check here to fail fast if that's not true
+        # Also need to implement an update property, such that the handle
+        # can be replaced on update which will replace the token
+        token = self._user_token()
+        self.data_set('token', token, True)
+        self.data_set('endpoint', '%s/signal' % self._get_resource_endpoint())
+
+    def _get_resource_endpoint(self):
+        # Get the endpoint from stack.clients then replace the context
+        # project_id with the path to the resource (which includes the
+        # context project_id), then replace the context project with
+        # the one needed for signalling from the stack_user_project
+        heat_client_plugin = self.stack.clients.client_plugin('heat')
+        endpoint = heat_client_plugin.get_heat_url()
+        rsrc_ep = endpoint.replace(self.context.tenant_id,
+                                   self.identifier().url_path())
+        return rsrc_ep.replace(self.context.tenant_id,
+                               self.stack.stack_user_project_id)
+
+    def handle_delete(self):
+        self._delete_user()
+
+    @property
+    def password(self):
+        return self.data().get('password')
+
+    def _resolve_attribute(self, key):
+        if self.resource_id:
+            if key == self.TOKEN:
+                return self.data().get('token')
+            elif key == self.ENDPOINT:
+                return self.data().get('endpoint')
+            elif key == self.CURL_CLI:
+                # Construct curl command for template-author convenience
+                return ('curl -i -X POST '
+                        '-H \'X-Auth-Token: %(token)s\' '
+                        '-H \'Content-Type: application/json\' '
+                        '-H \'Accept: application/json\' '
+                        '%(endpoint)s' %
+                        dict(token=self.data().get('token'),
+                             endpoint=self.data().get('endpoint')))
+
+    def handle_signal(self, details=None):
+        '''
+        Validate and update the resource metadata.
+        metadata is not mandatory, but if passed it must use the following
+        format:
+        {
+            "status" : "Status (must be SUCCESS or FAILURE)",
+            "data" : "Arbitrary data",
+            "reason" : "Reason string"
+        }
+        Optionally "id" may also be specified, but if missing the index
+        of the signal received will be used.
+        '''
+        rsrc_metadata = self.metadata_get(refresh=True)
+        signal_num = len(rsrc_metadata) + 1
+        reason = 'Signal %s received' % signal_num
+        # Tolerate missing values, default to success
+        metadata = details or {}
+        metadata.setdefault(self.REASON, reason)
+        metadata.setdefault(self.DATA, None)
+        metadata.setdefault(self.UNIQUE_ID, signal_num)
+        metadata.setdefault(self.STATUS, self.STATUS_SUCCESS)
+        return super(HeatWaitConditionHandle, self).handle_signal(metadata)
+
+
+class WaitConditionHandle(BaseWaitConditionHandle):
     '''
     the main point of this class is to :
-    have no dependancies (so the instance can reference it)
-    generate a unique url (to be returned in the refernce)
+    have no dependencies (so the instance can reference it)
+    generate a unique url (to be returned in the reference)
     then the cfn-signal will use this url to post to and
     WaitCondition will poll it to see if has been written to.
     '''
-    properties_schema = {}
+    METADATA_KEYS = (
+        DATA, REASON, STATUS, UNIQUE_ID
+    ) = (
+        'Data', 'Reason', 'Status', 'UniqueId'
+    )
+
+    def handle_create(self):
+        super(WaitConditionHandle, self).handle_create()
+        self.resource_id_set(self._get_user_id())
 
     def FnGetRefId(self):
         '''
@@ -46,125 +232,112 @@ class WaitConditionHandle(signal_responder.SignalResponder):
         else:
             return unicode(self.name)
 
-    def _metadata_format_ok(self, metadata):
-        """
-        Check the format of the provided metadata is as expected.
+    def metadata_update(self, new_metadata=None):
+        """DEPRECATED. Should use handle_signal instead."""
+        self.handle_signal(details=new_metadata)
+
+    def handle_signal(self, details=None):
+        '''
+        Validate and update the resource metadata
         metadata must use the following format:
         {
-            "Status" : "Status (must be SUCCESS or FAILURE)"
+            "Status" : "Status (must be SUCCESS or FAILURE)",
             "UniqueId" : "Some ID, should be unique for Count>1",
             "Data" : "Arbitrary Data",
             "Reason" : "Reason String"
         }
-        """
-        expected_keys = ['Data', 'Reason', 'Status', 'UniqueId']
-        if sorted(metadata.keys()) == expected_keys:
-            return metadata['Status'] in WAIT_STATUSES
-
-    def metadata_update(self, new_metadata=None):
         '''
-        Validate and update the resource metadata
-        '''
-        if new_metadata is None:
+        if details is None:
             return
-
-        if self._metadata_format_ok(new_metadata):
-            rsrc_metadata = self.metadata
-            if new_metadata['UniqueId'] in rsrc_metadata:
-                logger.warning("Overwriting Metadata item for UniqueId %s!" %
-                               new_metadata['UniqueId'])
-            safe_metadata = {}
-            for k in ('Data', 'Reason', 'Status'):
-                safe_metadata[k] = new_metadata[k]
-            # Note we can't update self.metadata directly, as it
-            # is a Metadata descriptor object which only supports get/set
-            rsrc_metadata.update({new_metadata['UniqueId']: safe_metadata})
-            self.metadata = rsrc_metadata
-        else:
-            logger.error("Metadata failed validation for %s" % self.name)
-            raise ValueError("Metadata format invalid")
-
-    def get_status(self):
-        '''
-        Return a list of the Status values for the handle signals
-        '''
-        return [self.metadata[s]['Status']
-                for s in self.metadata]
-
-    def get_status_reason(self, status):
-        '''
-        Return the reason associated with a particular status
-        If there is more than one handle signal matching the specified status
-        then return a semicolon delimited string containing all reasons
-        '''
-        return ';'.join([self.metadata[s]['Reason']
-                        for s in self.metadata
-                        if self.metadata[s]['Status'] == status])
+        return super(WaitConditionHandle, self).handle_signal(details)
 
 
-WAIT_STATUSES = (
-    STATUS_FAILURE,
-    STATUS_SUCCESS,
-) = (
-    'FAILURE',
-    'SUCCESS',
-)
+class UpdateWaitConditionHandle(WaitConditionHandle):
+    '''
+    This works identically to a regular WaitConditionHandle, except that
+    on update it clears all signals received and changes the handle. Using
+    this handle means that you must setup the signal senders to send their
+    signals again any time the update handle changes. This allows us to roll
+    out new configurations and be confident that they are rolled out once
+    UPDATE COMPLETE is reached.
+    '''
+    def update(self, after, before=None, prev_resource=None):
+        raise resource.UpdateReplace(self.name)
 
 
-class WaitConditionFailure(Exception):
+class WaitConditionFailure(exception.Error):
     def __init__(self, wait_condition, handle):
-        reasons = handle.get_status_reason(STATUS_FAILURE)
-        super(WaitConditionFailure, self).__init__(reasons)
+        reasons = handle.get_status_reason(handle.STATUS_FAILURE)
+        super(WaitConditionFailure, self).__init__(';'.join(reasons))
 
 
-class WaitConditionTimeout(Exception):
+class WaitConditionTimeout(exception.Error):
     def __init__(self, wait_condition, handle):
-        reasons = handle.get_status_reason(STATUS_SUCCESS)
-        message = '%d of %d received' % (len(reasons), wait_condition.count)
+        reasons = handle.get_status_reason(handle.STATUS_SUCCESS)
+        vals = {'len': len(reasons),
+                'count': wait_condition.properties[wait_condition.COUNT]}
         if reasons:
-            message += ' - %s' % reasons
-
+            vals['reasons'] = ';'.join(reasons)
+            message = (_('%(len)d of %(count)d received - %(reasons)s') % vals)
+        else:
+            message = (_('%(len)d of %(count)d received') % vals)
         super(WaitConditionTimeout, self).__init__(message)
 
 
-class WaitCondition(resource.Resource):
-    properties_schema = {'Handle': {'Type': 'String',
-                                    'Required': True},
-                         'Timeout': {'Type': 'Number',
-                                     'Required': True,
-                                     'MinValue': '1'},
-                         'Count': {'Type': 'Number',
-                                   'MinValue': '1'}}
+class HeatWaitCondition(resource.Resource):
+    PROPERTIES = (
+        HANDLE, TIMEOUT, COUNT,
+    ) = (
+        'handle', 'timeout', 'count',
+    )
 
-    def __init__(self, name, json_snippet, stack):
-        super(WaitCondition, self).__init__(name, json_snippet, stack)
+    ATTRIBUTES = (
+        DATA,
+    ) = (
+        'data',
+    )
 
-        self.count = int(self.t['Properties'].get('Count', '1'))
+    properties_schema = {
+        HANDLE: properties.Schema(
+            properties.Schema.STRING,
+            _('A reference to the wait condition handle used to signal this '
+              'wait condition.'),
+            required=True
+        ),
+        TIMEOUT: properties.Schema(
+            properties.Schema.NUMBER,
+            _('The number of seconds to wait for the correct number of '
+              'signals to arrive.'),
+            required=True,
+            constraints=[
+                constraints.Range(1, 43200),
+            ]
+        ),
+        COUNT: properties.Schema(
+            properties.Schema.NUMBER,
+            _('The number of success signals that must be received before '
+              'the stack creation process continues.'),
+            constraints=[
+                constraints.Range(min=1),
+            ],
+            default=1,
+            update_allowed=True
+        ),
+    }
 
-    def _validate_handle_url(self):
-        handle_url = self.properties['Handle']
-        handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
-        if handle_id.tenant != self.stack.context.tenant_id:
-            raise ValueError("WaitCondition invalid Handle tenant %s" %
-                             handle_id.tenant)
-        if handle_id.stack_name != self.stack.name:
-            raise ValueError("WaitCondition invalid Handle stack %s" %
-                             handle_id.stack_name)
-        if handle_id.stack_id != self.stack.id:
-            raise ValueError("WaitCondition invalid Handle stack %s" %
-                             handle_id.stack_id)
-        if handle_id.resource_name not in self.stack:
-            raise ValueError("WaitCondition invalid Handle %s" %
-                             handle_id.resource_name)
-        if not isinstance(self.stack[handle_id.resource_name],
-                          WaitConditionHandle):
-            raise ValueError("WaitCondition invalid Handle %s" %
-                             handle_id.resource_name)
+    attributes_schema = {
+        DATA: attributes.Schema(
+            _('JSON serialized dict containing data associated with wait '
+              'condition signals sent to the handle.'),
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
+    }
 
-    def _get_handle_resource_name(self):
-        handle_url = self.properties['Handle']
-        handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
-        return handle_id.resource_name
+    def __init__(self, name, definition, stack):
+        super(HeatWaitCondition, self).__init__(name, definition, stack)
+
+    def _get_handle_resource(self):
+        return self.stack.resource_by_refid(self.properties[self.HANDLE])
 
     def _wait(self, handle):
         while True:
@@ -172,58 +345,151 @@ class WaitCondition(resource.Resource):
                 yield
             except scheduler.Timeout:
                 timeout = WaitConditionTimeout(self, handle)
-                logger.info('%s Timed out (%s)' % (str(self), str(timeout)))
+                LOG.info(_('%(name)s Timed out (%(timeout)s)')
+                         % {'name': str(self), 'timeout': str(timeout)})
                 raise timeout
 
             handle_status = handle.get_status()
 
-            if any(s != STATUS_SUCCESS for s in handle_status):
+            if any(s != handle.STATUS_SUCCESS for s in handle_status):
                 failure = WaitConditionFailure(self, handle)
-                logger.info('%s Failed (%s)' % (str(self), str(failure)))
+                LOG.info(_('%(name)s Failed (%(failure)s)')
+                         % {'name': str(self), 'failure': str(failure)})
                 raise failure
 
-            if len(handle_status) >= self.count:
-                logger.info("%s Succeeded" % str(self))
+            if len(handle_status) >= self.properties[self.COUNT]:
+                LOG.info(_("%s Succeeded") % str(self))
                 return
 
     def handle_create(self):
-        self._validate_handle_url()
-        handle_res_name = self._get_handle_resource_name()
-        handle = self.stack[handle_res_name]
-        self.resource_id_set(handle_res_name)
-
+        handle = self._get_handle_resource()
         runner = scheduler.TaskRunner(self._wait, handle)
-        runner.start(timeout=float(self.properties['Timeout']))
+        runner.start(timeout=float(self.properties[self.TIMEOUT]))
         return runner
 
     def check_create_complete(self, runner):
         return runner.step()
 
+    def handle_update(self, json_snippet, tmpl_diff, prop_diff):
+        if prop_diff:
+            self.properties = json_snippet.properties(self.properties_schema,
+                                                      self.context)
+
+        handle = self._get_handle_resource()
+        runner = scheduler.TaskRunner(self._wait, handle)
+        runner.start(timeout=float(self.properties[self.TIMEOUT]))
+        return runner
+
+    def check_update_complete(self, runner):
+        return runner.step()
+
     def handle_delete(self):
-        if self.resource_id is None:
-            return
+        handle = self._get_handle_resource()
+        if handle:
+            handle.metadata_set({})
 
-        handle = self.stack[self.resource_id]
-        handle.metadata = {}
-
-    def FnGetAtt(self, key):
+    def _resolve_attribute(self, key):
         res = {}
-        handle_res_name = self._get_handle_resource_name()
-        handle = self.stack[handle_res_name]
-        if key == 'Data':
-            meta = handle.metadata
+        handle = self._get_handle_resource()
+        if key == self.DATA:
+            meta = handle.metadata_get(refresh=True)
             # Note, can't use a dict generator on python 2.6, hence:
-            res = dict([(k, meta[k]['Data']) for k in meta])
-        else:
-            raise exception.InvalidTemplateAttribute(resource=self.name,
-                                                     key=key)
+            res = dict([(k, meta[k][handle.DATA]) for k in meta])
+            LOG.debug('%(name)s.GetAtt(%(key)s) == %(res)s'
+                      % {'name': self.name,
+                         'key': key,
+                         'res': res})
 
-        logger.debug('%s.GetAtt(%s) == %s' % (self.name, key, res))
-        return unicode(json.dumps(res))
+            return unicode(json.dumps(res))
+
+
+class WaitCondition(HeatWaitCondition):
+    PROPERTIES = (
+        HANDLE, TIMEOUT, COUNT,
+    ) = (
+        'Handle', 'Timeout', 'Count',
+    )
+
+    ATTRIBUTES = (
+        DATA,
+    ) = (
+        'Data',
+    )
+
+    properties_schema = {
+        HANDLE: properties.Schema(
+            properties.Schema.STRING,
+            _('A reference to the wait condition handle used to signal this '
+              'wait condition.'),
+            required=True
+        ),
+        TIMEOUT: properties.Schema(
+            properties.Schema.NUMBER,
+            _('The number of seconds to wait for the correct number of '
+              'signals to arrive.'),
+            required=True,
+            constraints=[
+                constraints.Range(1, 43200),
+            ]
+        ),
+        COUNT: properties.Schema(
+            properties.Schema.NUMBER,
+            _('The number of success signals that must be received before '
+              'the stack creation process continues.'),
+            constraints=[
+                constraints.Range(min=1),
+            ],
+            default=1,
+            update_allowed=True
+        ),
+    }
+
+    attributes_schema = {
+        DATA: attributes.Schema(
+            _('JSON serialized dict containing data associated with wait '
+              'condition signals sent to the handle.'),
+            cache_mode=attributes.Schema.CACHE_NONE
+        ),
+    }
+
+    def __init__(self, name, json_snippet, stack):
+        super(WaitCondition, self).__init__(name, json_snippet, stack)
+
+    def _validate_handle_url(self):
+        handle_url = self.properties[self.HANDLE]
+        handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
+        if handle_id.tenant != self.stack.context.tenant_id:
+            raise ValueError(_("WaitCondition invalid Handle tenant %s") %
+                             handle_id.tenant)
+        if handle_id.stack_name != self.stack.name:
+            raise ValueError(_("WaitCondition invalid Handle stack %s") %
+                             handle_id.stack_name)
+        if handle_id.stack_id != self.stack.id:
+            raise ValueError(_("WaitCondition invalid Handle stack %s") %
+                             handle_id.stack_id)
+        if handle_id.resource_name not in self.stack:
+            raise ValueError(_("WaitCondition invalid Handle %s") %
+                             handle_id.resource_name)
+        if not isinstance(self.stack[handle_id.resource_name],
+                          WaitConditionHandle):
+            raise ValueError(_("WaitCondition invalid Handle %s") %
+                             handle_id.resource_name)
+
+    def _get_handle_resource(self):
+        handle_url = self.properties[self.HANDLE]
+        handle_id = identifier.ResourceIdentifier.from_arn_url(handle_url)
+        return self.stack[handle_id.resource_name]
+
+    def handle_create(self):
+        self._validate_handle_url()
+        return super(WaitCondition, self).handle_create()
 
 
 def resource_mapping():
     return {
         'AWS::CloudFormation::WaitCondition': WaitCondition,
+        'OS::Heat::WaitCondition': HeatWaitCondition,
+        'OS::Heat::WaitConditionHandle': HeatWaitConditionHandle,
         'AWS::CloudFormation::WaitConditionHandle': WaitConditionHandle,
+        'OS::Heat::UpdateWaitConditionHandle': UpdateWaitConditionHandle,
     }

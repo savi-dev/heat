@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,13 +11,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from heat.rpc import api
-from heat.openstack.common import timeutils
-from heat.engine import template
+from oslo.utils import timeutils
 
+from heat.common.i18n import _
+from heat.common import param_utils
+from heat.common import template_format
+from heat.engine import constraints as constr
 from heat.openstack.common import log as logging
+from heat.rpc import api
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 def extract_args(params):
@@ -28,25 +30,36 @@ def extract_args(params):
     conversion where appropriate
     '''
     kwargs = {}
-    try:
-        timeout_mins = int(params.get(api.PARAM_TIMEOUT, 0))
-    except (ValueError, TypeError):
-        logger.exception('create timeout conversion')
-    else:
-        if timeout_mins > 0:
-            kwargs[api.PARAM_TIMEOUT] = timeout_mins
+    timeout_mins = params.get(api.PARAM_TIMEOUT)
+    if timeout_mins not in ('0', 0, None):
+        try:
+            timeout = int(timeout_mins)
+        except (ValueError, TypeError):
+            LOG.exception(_('Timeout conversion failed'))
+        else:
+            if timeout > 0:
+                kwargs[api.PARAM_TIMEOUT] = timeout
+            else:
+                raise ValueError(_('Invalid timeout value %s') % timeout)
 
     if api.PARAM_DISABLE_ROLLBACK in params:
-        disable_rollback = params.get(api.PARAM_DISABLE_ROLLBACK)
-        if str(disable_rollback).lower() == 'true':
-            kwargs[api.PARAM_DISABLE_ROLLBACK] = True
-        elif str(disable_rollback).lower() == 'false':
-            kwargs[api.PARAM_DISABLE_ROLLBACK] = False
-        else:
-            raise ValueError(_('Unexpected value for parameter'
-                               ' %(name)s : %(value)s') %
-                             dict(name=api.PARAM_DISABLE_ROLLBACK,
-                                  value=disable_rollback))
+        disable_rollback = param_utils.extract_bool(
+            params[api.PARAM_DISABLE_ROLLBACK])
+        kwargs[api.PARAM_DISABLE_ROLLBACK] = disable_rollback
+
+    if api.PARAM_SHOW_DELETED in params:
+        params[api.PARAM_SHOW_DELETED] = param_utils.extract_bool(
+            params[api.PARAM_SHOW_DELETED])
+
+    adopt_data = params.get(api.PARAM_ADOPT_STACK_DATA)
+    if adopt_data:
+        adopt_data = template_format.simple_parse(adopt_data)
+        if not isinstance(adopt_data, dict):
+            raise ValueError(
+                _('Unexpected adopt data "%s". Adopt data must be a dict.')
+                % adopt_data)
+        kwargs[api.PARAM_ADOPT_STACK_DATA] = adopt_data
+
     return kwargs
 
 
@@ -56,44 +69,68 @@ def format_stack_outputs(stack, outputs):
     that matches the API output expectations.
     '''
     def format_stack_output(k):
-        return {api.OUTPUT_DESCRIPTION: outputs[k].get('Description',
-                                                       'No description given'),
-                api.OUTPUT_KEY: k,
-                api.OUTPUT_VALUE: stack.output(k)}
+        output = {
+            api.OUTPUT_DESCRIPTION: outputs[k].get('Description',
+                                                   'No description given'),
+            api.OUTPUT_KEY: k,
+            api.OUTPUT_VALUE: stack.output(k)
+        }
+        if outputs[k].get('error_msg'):
+            output.update({api.OUTPUT_ERROR: outputs[k].get('error_msg')})
+        return output
 
     return [format_stack_output(key) for key in outputs]
 
 
-def format_stack(stack):
+def format_stack(stack, preview=False):
     '''
     Return a representation of the given stack that matches the API output
     expectations.
     '''
+    updated_time = stack.updated_time and timeutils.isotime(stack.updated_time)
     info = {
         api.STACK_NAME: stack.name,
         api.STACK_ID: dict(stack.identifier()),
         api.STACK_CREATION_TIME: timeutils.isotime(stack.created_time),
-        api.STACK_UPDATED_TIME: timeutils.isotime(stack.updated_time),
+        api.STACK_UPDATED_TIME: updated_time,
         api.STACK_NOTIFICATION_TOPICS: [],  # TODO Not implemented yet
         api.STACK_PARAMETERS: stack.parameters.map(str),
-        api.STACK_DESCRIPTION: stack.t[template.DESCRIPTION],
-        api.STACK_TMPL_DESCRIPTION: stack.t[template.DESCRIPTION],
-        api.STACK_ACTION: stack.action or '',
-        api.STACK_STATUS: stack.status or '',
-        api.STACK_STATUS_DATA: stack.status_reason,
+        api.STACK_DESCRIPTION: stack.t[stack.t.DESCRIPTION],
+        api.STACK_TMPL_DESCRIPTION: stack.t[stack.t.DESCRIPTION],
         api.STACK_CAPABILITIES: [],   # TODO Not implemented yet
         api.STACK_DISABLE_ROLLBACK: stack.disable_rollback,
         api.STACK_TIMEOUT: stack.timeout_mins,
+        api.STACK_OWNER: stack.username,
+        api.STACK_PARENT: stack.owner_id,
     }
 
-    # only show the outputs on a completely created or updated stack
-    if (stack.action != stack.DELETE and stack.status == stack.COMPLETE):
+    if not preview:
+        update_info = {
+            api.STACK_ACTION: stack.action or '',
+            api.STACK_STATUS: stack.status or '',
+            api.STACK_STATUS_DATA: stack.status_reason,
+        }
+        info.update(update_info)
+
+    # allow users to view the outputs of stacks
+    if (stack.action != stack.DELETE and stack.status != stack.IN_PROGRESS):
         info[api.STACK_OUTPUTS] = format_stack_outputs(stack, stack.outputs)
 
     return info
 
 
-def format_stack_resource(resource, detail=True):
+def format_resource_properties(resource):
+    def get_property(prop):
+        try:
+            return resource.properties[prop]
+        except (KeyError, ValueError):
+            return None
+
+    return dict((prop, get_property(prop))
+                for prop in resource.properties_schema.keys())
+
+
+def format_stack_resource(resource, detail=True, with_props=False):
     '''
     Return a representation of the given resource that matches the API output
     expectations.
@@ -103,22 +140,44 @@ def format_stack_resource(resource, detail=True):
         api.RES_UPDATED_TIME: timeutils.isotime(last_updated_time),
         api.RES_NAME: resource.name,
         api.RES_PHYSICAL_ID: resource.resource_id or '',
-        api.RES_METADATA: resource.metadata,
         api.RES_ACTION: resource.action,
         api.RES_STATUS: resource.status,
         api.RES_STATUS_DATA: resource.status_reason,
-        api.RES_TYPE: resource.t['Type'],
+        api.RES_TYPE: resource.type(),
         api.RES_ID: dict(resource.identifier()),
         api.RES_STACK_ID: dict(resource.stack.identifier()),
         api.RES_STACK_NAME: resource.stack.name,
         api.RES_REQUIRED_BY: resource.required_by(),
     }
 
+    if (hasattr(resource, 'nested') and callable(resource.nested) and
+            resource.nested()):
+        res[api.RES_NESTED_STACK_ID] = dict(resource.nested().identifier())
+
+    if resource.stack.parent_resource:
+        res[api.RES_PARENT_RESOURCE] = resource.stack.parent_resource.name
+
     if detail:
-        res[api.RES_DESCRIPTION] = resource.parsed_template('Description', '')
-        res[api.RES_METADATA] = resource.metadata
+        res[api.RES_DESCRIPTION] = resource.t.description
+        res[api.RES_METADATA] = resource.metadata_get()
+
+    if with_props:
+        res[api.RES_SCHEMA_PROPERTIES] = format_resource_properties(resource)
 
     return res
+
+
+def format_stack_preview(stack):
+    def format_resource(res):
+        if isinstance(res, list):
+            return map(format_resource, res)
+        return format_stack_resource(res, with_props=True)
+
+    fmt_stack = format_stack(stack, preview=True)
+    fmt_resources = map(format_resource, stack.preview_resources())
+    fmt_stack['resources'] = fmt_resources
+
+    return fmt_stack
 
 
 def format_event(event):
@@ -138,6 +197,27 @@ def format_event(event):
         api.EVENT_RES_PROPERTIES: event.resource_properties,
     }
 
+    return result
+
+
+def format_notification_body(stack):
+    # some other possibilities here are:
+    # - template name
+    # - template size
+    # - resource count
+    if stack.status is not None and stack.action is not None:
+        state = '_'.join(stack.state)
+    else:
+        state = 'Unknown'
+    result = {
+        api.NOTIFY_TENANT_ID: stack.context.tenant_id,
+        api.NOTIFY_USER_ID: stack.context.user,
+        api.NOTIFY_STACK_ID: stack.identifier().arn(),
+        api.NOTIFY_STACK_NAME: stack.name,
+        api.NOTIFY_STATE: state,
+        api.NOTIFY_STATE_REASON: stack.status_reason,
+        api.NOTIFY_CREATE_AT: timeutils.isotime(stack.created_time),
+    }
     return result
 
 
@@ -184,7 +264,7 @@ def format_watch_data(wd):
     if len(metric) == 1:
         metric_name, metric_data = metric[0]
     else:
-        logger.error("Unexpected number of keys in watch_data.data!")
+        LOG.error(_("Unexpected number of keys in watch_data.data!"))
         return
 
     result = {
@@ -195,4 +275,115 @@ def format_watch_data(wd):
         api.WATCH_DATA: metric_data
     }
 
+    return result
+
+
+def format_validate_parameter(param):
+    """
+    Format a template parameter for validate template API call
+
+    Formats a template parameter and its schema information from the engine's
+    internal representation (i.e. a Parameter object and its associated
+    Schema object) to a representation expected by the current API (for example
+    to be compatible to CFN syntax).
+    """
+
+    # map of Schema object types to API expected types
+    schema_to_api_types = {
+        param.schema.STRING: api.PARAM_TYPE_STRING,
+        param.schema.NUMBER: api.PARAM_TYPE_NUMBER,
+        param.schema.LIST: api.PARAM_TYPE_COMMA_DELIMITED_LIST,
+        param.schema.MAP: api.PARAM_TYPE_JSON,
+        param.schema.BOOLEAN: api.PARAM_TYPE_BOOLEAN
+    }
+
+    res = {
+        api.PARAM_TYPE: schema_to_api_types.get(param.schema.type,
+                                                param.schema.type),
+        api.PARAM_DESCRIPTION: param.description(),
+        api.PARAM_NO_ECHO: 'true' if param.hidden() else 'false',
+        api.PARAM_LABEL: param.label()
+    }
+
+    if param.has_value():
+        res[api.PARAM_DEFAULT] = param.value()
+
+    constraint_description = []
+
+    # build constraints
+    for c in param.schema.constraints:
+        if isinstance(c, constr.Length):
+            if c.min is not None:
+                res[api.PARAM_MIN_LENGTH] = c.min
+
+            if c.max is not None:
+                res[api.PARAM_MAX_LENGTH] = c.max
+
+        elif isinstance(c, constr.Range):
+            if c.min is not None:
+                res[api.PARAM_MIN_VALUE] = c.min
+
+            if c.max is not None:
+                res[api.PARAM_MAX_VALUE] = c.max
+
+        elif isinstance(c, constr.AllowedValues):
+            res[api.PARAM_ALLOWED_VALUES] = list(c.allowed)
+
+        elif isinstance(c, constr.AllowedPattern):
+            res[api.PARAM_ALLOWED_PATTERN] = c.pattern
+
+        elif isinstance(c, constr.CustomConstraint):
+            res[api.PARAM_CUSTOM_CONSTRAINT] = c.name
+
+        if c.description:
+            constraint_description.append(c.description)
+
+    if constraint_description:
+        res[api.PARAM_CONSTRAINT_DESCRIPTION] = " ".join(
+            constraint_description)
+
+    return res
+
+
+def format_software_config(sc):
+    if sc is None:
+        return
+    result = {
+        api.SOFTWARE_CONFIG_ID: sc.id,
+        api.SOFTWARE_CONFIG_NAME: sc.name,
+        api.SOFTWARE_CONFIG_GROUP: sc.group,
+        api.SOFTWARE_CONFIG_CONFIG: sc.config['config'],
+        api.SOFTWARE_CONFIG_INPUTS: sc.config['inputs'],
+        api.SOFTWARE_CONFIG_OUTPUTS: sc.config['outputs'],
+        api.SOFTWARE_CONFIG_OPTIONS: sc.config['options']
+    }
+    return result
+
+
+def format_software_deployment(sd):
+    if sd is None:
+        return
+    result = {
+        api.SOFTWARE_DEPLOYMENT_ID: sd.id,
+        api.SOFTWARE_DEPLOYMENT_SERVER_ID: sd.server_id,
+        api.SOFTWARE_DEPLOYMENT_INPUT_VALUES: sd.input_values,
+        api.SOFTWARE_DEPLOYMENT_OUTPUT_VALUES: sd.output_values,
+        api.SOFTWARE_DEPLOYMENT_ACTION: sd.action,
+        api.SOFTWARE_DEPLOYMENT_STATUS: sd.status,
+        api.SOFTWARE_DEPLOYMENT_STATUS_REASON: sd.status_reason,
+        api.SOFTWARE_DEPLOYMENT_CONFIG_ID: sd.config.id,
+    }
+    return result
+
+
+def format_snapshot(snapshot):
+    if snapshot is None:
+        return
+    result = {
+        api.SNAPSHOT_ID: snapshot.id,
+        api.SNAPSHOT_NAME: snapshot.name,
+        api.SNAPSHOT_STATUS: snapshot.status,
+        api.SNAPSHOT_STATUS_REASON: snapshot.status_reason,
+        api.SNAPSHOT_DATA: snapshot.data,
+    }
     return result

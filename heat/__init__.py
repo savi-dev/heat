@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
@@ -15,7 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from heat.openstack.common import gettextutils
+from oslo import i18n
 
-
-gettextutils.install('heat')
+i18n.enable_lazy()
+# fixme(elynn): Since install() is deprecated, we should remove it in
+# the future
+i18n.install('heat')

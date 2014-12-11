@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,21 +11,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import urllib
-import urlparse
-
-from oslo.config import cfg
-
 from keystoneclient.contrib.ec2 import utils as ec2_utils
+from oslo.config import cfg
+from six.moves.urllib import parse as urlparse
 
-from heat.db import api as db_api
-from heat.common import exception
-from heat.engine import clients
-from heat.engine import resource
+from heat.common.i18n import _
+from heat.engine import stack_user
+from heat.openstack.common import log as logging
 
-from heat.openstack.common import log
 
-LOG = log.getLogger(__name__)
+LOG = logging.getLogger(__name__)
+
 SIGNAL_TYPES = (
     WAITCONDITION, SIGNAL
 ) = (
@@ -37,81 +31,71 @@ SIGNAL_VERB = {WAITCONDITION: 'PUT',
                SIGNAL: 'POST'}
 
 
-class SignalResponder(resource.Resource):
+class SignalResponder(stack_user.StackUser):
 
     # Anything which subclasses this may trigger authenticated
     # API operations as a consequence of handling a signal
     requires_deferred_auth = True
 
     def handle_create(self):
-        # Create a keystone user so we can create a signed URL via FnGetRefId
-        user_id = self.keystone().create_stack_user(
-            self.physical_resource_name())
-        kp = self.keystone().get_ec2_keypair(user_id)
-        if not kp:
-            raise exception.Error("Error creating ec2 keypair for user %s" %
-                                  user_id)
-        else:
-            self.resource_id_set(user_id)
+        super(SignalResponder, self).handle_create()
+        self._create_keypair()
 
     def handle_delete(self):
-        if self.resource_id is None:
-            return
-        try:
-            self.keystone().delete_stack_user(self.resource_id)
-        except clients.hkc.kc.exceptions.NotFound:
-            pass
-        try:
-            db_api.resource_data_delete(self, 'ec2_signed_url')
-        except exception.NotFound:
-            pass
+        super(SignalResponder, self).handle_delete()
+        self._delete_signed_url()
+
+    def _delete_signed_url(self):
+        self.data_delete('ec2_signed_url')
 
     def _get_signed_url(self, signal_type=SIGNAL):
         """Create properly formatted and pre-signed URL.
 
         This uses the created user for the credentials.
 
-        See http://docs.amazonwebservices.com/AWSECommerceService/latest/DG/
-        restarter-signature.html
-        Also see boto/auth.py::QuerySignatureV2AuthHandler
+        See boto/auth.py::QuerySignatureV2AuthHandler
 
         :param signal_type: either WAITCONDITION or SIGNAL.
         """
-        try:
-            stored = db_api.resource_data_get(self, 'ec2_signed_url')
-        except exception.NotFound:
-            stored = None
+        stored = self.data().get('ec2_signed_url')
         if stored is not None:
             return stored
+
+        access_key = self.data().get('access_key')
+        secret_key = self.data().get('secret_key')
+
+        if not access_key or not secret_key:
+            LOG.warning(_('Cannot generate signed url, '
+                          'no stored access/secret key'))
+            return
 
         waitcond_url = cfg.CONF.heat_waitcondition_server_url
         signal_url = waitcond_url.replace('/waitcondition', signal_type)
         host_url = urlparse.urlparse(signal_url)
 
         path = self.identifier().arn_url_path()
-        credentials = self.keystone().get_ec2_keypair(self.resource_id)
 
         # Note the WSGI spec apparently means that the webob request we end up
-        # prcessing in the CFN API (ec2token.py) has an unquoted path, so we
+        # processing in the CFN API (ec2token.py) has an unquoted path, so we
         # need to calculate the signature with the path component unquoted, but
         # ensure the actual URL contains the quoted version...
-        unquoted_path = urllib.unquote(host_url.path + path)
+        unquoted_path = urlparse.unquote(host_url.path + path)
         request = {'host': host_url.netloc.lower(),
                    'verb': SIGNAL_VERB[signal_type],
                    'path': unquoted_path,
                    'params': {'SignatureMethod': 'HmacSHA256',
                               'SignatureVersion': '2',
-                              'AWSAccessKeyId': credentials.access,
+                              'AWSAccessKeyId': access_key,
                               'Timestamp':
                               self.created_time.strftime("%Y-%m-%dT%H:%M:%SZ")
                               }}
-        # Sign the requested
-        signer = ec2_utils.Ec2Signer(credentials.secret)
+        # Sign the request
+        signer = ec2_utils.Ec2Signer(secret_key)
         request['params']['Signature'] = signer.generate(request)
 
-        qs = urllib.urlencode(request['params'])
+        qs = urlparse.urlencode(request['params'])
         url = "%s%s?%s" % (signal_url.lower(),
                            path, qs)
 
-        db_api.resource_data_set(self, 'ec2_signed_url', url)
+        self.data_set('ec2_signed_url', url)
         return url

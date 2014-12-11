@@ -1,4 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,9 +14,13 @@
 ENGINE_TOPIC = 'engine'
 
 PARAM_KEYS = (
-    PARAM_TIMEOUT, PARAM_DISABLE_ROLLBACK
+    PARAM_TIMEOUT, PARAM_DISABLE_ROLLBACK, PARAM_ADOPT_STACK_DATA,
+    PARAM_SHOW_DELETED, PARAM_SHOW_NESTED, PARAM_EXISTING,
+    PARAM_CLEAR_PARAMETERS
 ) = (
-    'timeout_mins', 'disable_rollback'
+    'timeout_mins', 'disable_rollback', 'adopt_stack_data',
+    'show_deleted', 'show_nested', 'existing',
+    'clear_parameters'
 )
 
 STACK_KEYS = (
@@ -27,7 +30,8 @@ STACK_KEYS = (
     STACK_DESCRIPTION, STACK_TMPL_DESCRIPTION,
     STACK_PARAMETERS, STACK_OUTPUTS, STACK_ACTION,
     STACK_STATUS, STACK_STATUS_DATA, STACK_CAPABILITIES,
-    STACK_DISABLE_ROLLBACK, STACK_TIMEOUT,
+    STACK_DISABLE_ROLLBACK, STACK_TIMEOUT, STACK_OWNER,
+    STACK_PARENT
 ) = (
     'stack_name', 'stack_identity',
     'creation_time', 'updated_time', 'deletion_time',
@@ -35,15 +39,18 @@ STACK_KEYS = (
     'description', 'template_description',
     'parameters', 'outputs', 'stack_action',
     'stack_status', 'stack_status_reason', 'capabilities',
-    'disable_rollback', 'timeout_mins',
+    'disable_rollback', 'timeout_mins', 'stack_owner',
+    'parent'
 )
 
 STACK_OUTPUT_KEYS = (
     OUTPUT_DESCRIPTION,
     OUTPUT_KEY, OUTPUT_VALUE,
+    OUTPUT_ERROR,
 ) = (
     'description',
     'output_key', 'output_value',
+    'output_error',
 )
 
 RES_KEYS = (
@@ -51,13 +58,15 @@ RES_KEYS = (
     RES_NAME, RES_PHYSICAL_ID, RES_METADATA,
     RES_ACTION, RES_STATUS, RES_STATUS_DATA,
     RES_TYPE, RES_ID, RES_STACK_ID, RES_STACK_NAME,
-    RES_REQUIRED_BY,
+    RES_REQUIRED_BY, RES_NESTED_STACK_ID, RES_NESTED_RESOURCES,
+    RES_PARENT_RESOURCE,
 ) = (
     'description', 'updated_time',
     'resource_name', 'physical_resource_id', 'metadata',
     'resource_action', 'resource_status', 'resource_status_reason',
     'resource_type', 'resource_identity', STACK_ID, STACK_NAME,
-    'required_by',
+    'required_by', 'nested_stack_id', 'nested_resources',
+    'parent_resource',
 )
 
 RES_SCHEMA_KEYS = (
@@ -76,10 +85,28 @@ EVENT_KEYS = (
 ) = (
     'event_identity',
     STACK_ID, STACK_NAME,
-    "event_time",
+    'event_time',
     RES_NAME, RES_PHYSICAL_ID, RES_ACTION,
     RES_STATUS, RES_STATUS_DATA, RES_TYPE,
     'resource_properties',
+)
+
+NOTIFY_KEYS = (
+    NOTIFY_TENANT_ID,
+    NOTIFY_USER_ID,
+    NOTIFY_STACK_ID,
+    NOTIFY_STACK_NAME,
+    NOTIFY_STATE,
+    NOTIFY_STATE_REASON,
+    NOTIFY_CREATE_AT,
+) = (
+    'tenant_id',
+    'user_id',
+    STACK_ID,
+    STACK_NAME,
+    'state',
+    'state_reason',
+    'create_at',
 )
 
 # This is the representation of a watch we expose to the API via RPC
@@ -146,10 +173,76 @@ VALIDATE_PARAM_KEYS = (
     PARAM_TYPE, PARAM_DEFAULT, PARAM_NO_ECHO,
     PARAM_ALLOWED_VALUES, PARAM_ALLOWED_PATTERN, PARAM_MAX_LENGTH,
     PARAM_MIN_LENGTH, PARAM_MAX_VALUE, PARAM_MIN_VALUE,
-    PARAM_DESCRIPTION, PARAM_CONSTRAINT_DESCRIPTION
+    PARAM_DESCRIPTION, PARAM_CONSTRAINT_DESCRIPTION, PARAM_LABEL,
+    PARAM_CUSTOM_CONSTRAINT
 ) = (
     'Type', 'Default', 'NoEcho',
     'AllowedValues', 'AllowedPattern', 'MaxLength',
     'MinLength', 'MaxValue', 'MinValue',
-    'Description', 'ConstraintDescription'
+    'Description', 'ConstraintDescription', 'Label',
+    'CustomConstraint'
 )
+
+VALIDATE_PARAM_TYPES = (
+    PARAM_TYPE_STRING, PARAM_TYPE_NUMBER, PARAM_TYPE_COMMA_DELIMITED_LIST,
+    PARAM_TYPE_JSON, PARAM_TYPE_BOOLEAN
+) = (
+    'String', 'Number', 'CommaDelimitedList',
+    'Json', 'Boolean'
+)
+
+SOFTWARE_CONFIG_KEYS = (
+    SOFTWARE_CONFIG_ID,
+    SOFTWARE_CONFIG_NAME,
+    SOFTWARE_CONFIG_GROUP,
+    SOFTWARE_CONFIG_CONFIG,
+    SOFTWARE_CONFIG_INPUTS,
+    SOFTWARE_CONFIG_OUTPUTS,
+    SOFTWARE_CONFIG_OPTIONS,
+) = (
+    'id',
+    'name',
+    'group',
+    'config',
+    'inputs',
+    'outputs',
+    'options',
+)
+
+SOFTWARE_DEPLOYMENT_KEYS = (
+    SOFTWARE_DEPLOYMENT_ID,
+    SOFTWARE_DEPLOYMENT_CONFIG_ID,
+    SOFTWARE_DEPLOYMENT_SERVER_ID,
+    SOFTWARE_DEPLOYMENT_INPUT_VALUES,
+    SOFTWARE_DEPLOYMENT_OUTPUT_VALUES,
+    SOFTWARE_DEPLOYMENT_ACTION,
+    SOFTWARE_DEPLOYMENT_STATUS,
+    SOFTWARE_DEPLOYMENT_STATUS_REASON
+) = (
+    'id',
+    'config_id',
+    'server_id',
+    'input_values',
+    'output_values',
+    'action',
+    'status',
+    'status_reason'
+)
+
+SNAPSHOT_KEYS = (
+    SNAPSHOT_ID,
+    SNAPSHOT_NAME,
+    SNAPSHOT_STACK_ID,
+    SNAPSHOT_DATA,
+    SNAPSHOT_STATUS,
+    SNAPSHOT_STATUS_REASON
+) = (
+    'id',
+    'name',
+    'stack_id',
+    'data',
+    'status',
+    'status_reason'
+)
+
+THREAD_MESSAGES = (THREAD_CANCEL,) = ('cancel',)

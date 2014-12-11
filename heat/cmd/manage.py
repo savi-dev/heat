@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -33,7 +32,7 @@ CONF = cfg.CONF
 
 def do_db_version():
     """Print database's current migration level."""
-    print(api.db_version())
+    print(api.db_version(api.get_engine()))
 
 
 def do_db_sync():
@@ -41,7 +40,7 @@ def do_db_sync():
     Place a database under migration control and upgrade,
     creating first if necessary.
     """
-    api.db_sync(CONF.command.version)
+    api.db_sync(api.get_engine(), CONF.command.version)
 
 
 def purge_deleted():
@@ -71,7 +70,7 @@ def add_command_parsers(subparsers):
 
 command_opt = cfg.SubCommandOpt('command',
                                 title='Commands',
-                                help='Available commands',
+                                help='Show available commands.',
                                 handler=add_command_parsers)
 
 

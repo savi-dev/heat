@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,8 +11,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import uuid
+
 import sqlalchemy
-from heat.openstack.common import uuidutils
 
 
 def upgrade(migrate_engine):
@@ -22,7 +22,7 @@ def upgrade(migrate_engine):
     resource = sqlalchemy.Table('resource', meta, autoload=True)
 
     resource.c.id.alter(sqlalchemy.String(36), primary_key=True,
-                        default=uuidutils.generate_uuid)
+                        default=lambda: str(uuid.uuid4()))
 
 
 def downgrade(migrate_engine):
@@ -32,6 +32,6 @@ def downgrade(migrate_engine):
 
     try:
         resource.c.id.alter(sqlalchemy.Integer, primary_key=True)
-    except:
+    except Exception:
         #XXX: since there is no way to downgrade just passing
         pass

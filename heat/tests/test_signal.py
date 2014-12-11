@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -14,19 +13,21 @@
 
 import datetime
 
+from keystoneclient import exceptions as kc_exceptions
 from oslo.config import cfg
-
-from heat.tests import generic_resource
-from heat.tests import fakes
-from heat.tests.common import HeatTestCase
-from heat.tests import utils
 
 from heat.common import exception
 from heat.common import template_format
-
+from heat.db import api as db_api
 from heat.engine import parser
 from heat.engine import resource
-from heat.engine import signal_responder as sr
+from heat.engine import scheduler
+from heat.engine import stack_user
+from heat.engine import template
+from heat.tests.common import HeatTestCase
+from heat.tests import fakes
+from heat.tests import generic_resource
+from heat.tests import utils
 
 
 test_template_signal = '''
@@ -37,9 +38,6 @@ test_template_signal = '''
   "Resources" : {
     "signal_handler" : {"Type" : "SignalResourceType"},
     "resource_X" : {"Type" : "GenericResourceType"}
-  },
-  "Outputs": {
-    "signed_url": {"Fn::GetAtt": ["signal_handler", "AlarmUrl"]}
   }
 }
 '''
@@ -49,7 +47,6 @@ class SignalTest(HeatTestCase):
 
     def setUp(self):
         super(SignalTest, self).setUp()
-        utils.setup_dummy_db()
 
         resource._register_class('SignalResourceType',
                                  generic_resource.SignalResource)
@@ -60,36 +57,91 @@ class SignalTest(HeatTestCase):
                              'http://server.test:8000/v1/waitcondition')
 
         self.stack_id = 'STACKABCD1234'
-        self.fc = fakes.FakeKeystoneClient()
 
     def tearDown(self):
         super(SignalTest, self).tearDown()
-        utils.reset_dummy_db()
 
-    # Note tests creating a stack should be decorated with @stack_delete_after
-    # to ensure the stack is properly cleaned up
     def create_stack(self, stack_name='test_stack', stub=True):
-        temp = template_format.parse(test_template_signal)
-        template = parser.Template(temp)
+        templ = template.Template(template_format.parse(test_template_signal))
         ctx = utils.dummy_context()
         ctx.tenant_id = 'test_tenant'
-        stack = parser.Stack(ctx, stack_name, template,
+        stack = parser.Stack(ctx, stack_name, templ,
                              disable_rollback=True)
 
         # Stub out the stack ID so we have a known value
         with utils.UUIDStub(self.stack_id):
             stack.store()
-
         if stub:
-            self.m.StubOutWithMock(sr.SignalResponder, 'keystone')
-            sr.SignalResponder.keystone().MultipleTimes().AndReturn(
-                self.fc)
-
-        self.m.ReplayAll()
+            self.stub_keystoneclient()
 
         return stack
 
-    @utils.stack_delete_after
+    def test_handle_create_fail_keypair_raise(self):
+        self.stack = self.create_stack(stack_name='create_fail_keypair')
+
+        self.m.StubOutWithMock(stack_user.StackUser, '_create_keypair')
+        stack_user.StackUser._create_keypair().AndRaise(Exception('Failed'))
+        self.m.ReplayAll()
+
+        self.stack.create()
+
+        rsrc = self.stack['signal_handler']
+        rs_data = db_api.resource_data_get_all(rsrc)
+        self.assertEqual((rsrc.CREATE, rsrc.FAILED), rsrc.state)
+        self.assertIn('Failed', rsrc.status_reason)
+        self.assertEqual('1234', rs_data.get('user_id'))
+        self.assertIsNone(rsrc.resource_id)
+        self.m.VerifyAll()
+
+    def test_resource_data(self):
+        self.stack = self.create_stack(stack_name='resource_data_test',
+                                       stub=False)
+        self.stub_keystoneclient(
+            access='anaccesskey',
+            secret='verysecret',
+            credential_id='mycredential')
+        self.m.ReplayAll()
+
+        self.stack.create()
+
+        rsrc = self.stack['signal_handler']
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
+
+        # Ensure the resource data has been stored correctly
+        rs_data = db_api.resource_data_get_all(rsrc)
+        self.assertEqual('mycredential', rs_data.get('credential_id'))
+        self.assertEqual('anaccesskey', rs_data.get('access_key'))
+        self.assertEqual('verysecret', rs_data.get('secret_key'))
+        self.assertEqual('1234', rs_data.get('user_id'))
+        self.assertEqual(rsrc.resource_id, rs_data.get('user_id'))
+        self.assertEqual(4, len(rs_data.keys()))
+        self.m.VerifyAll()
+
+    def test_get_user_id(self):
+        self.stack = self.create_stack(stack_name='resource_data_test',
+                                       stub=False)
+        self.stub_keystoneclient(access='anaccesskey', secret='verysecret')
+        self.m.ReplayAll()
+
+        self.stack.create()
+
+        rsrc = self.stack['signal_handler']
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
+
+        # Ensure the resource data has been stored correctly
+        rs_data = db_api.resource_data_get_all(rsrc)
+        self.assertEqual('1234', rs_data.get('user_id'))
+        self.assertEqual('1234', rsrc.resource_id)
+        self.assertEqual('1234', rsrc._get_user_id())
+
+        # Check user id can still be fetched from resource_id
+        # if the resource data is not there.
+        db_api.resource_data_delete(rsrc, 'user_id')
+        self.assertRaises(
+            exception.NotFound, db_api.resource_data_get, rsrc, 'user_id')
+        self.assertEqual('1234', rsrc._get_user_id())
+        self.m.VerifyAll()
+
     def test_FnGetAtt_Alarm_Url(self):
         self.stack = self.create_stack()
 
@@ -99,7 +151,7 @@ class SignalTest(HeatTestCase):
         rsrc = self.stack['signal_handler']
         created_time = datetime.datetime(2012, 11, 29, 13, 49, 37)
         rsrc.created_time = created_time
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         expected_url = "".join([
             'http://server.test:8000/v1/signal/',
@@ -116,7 +168,6 @@ class SignalTest(HeatTestCase):
         self.assertEqual(expected_url, rsrc.FnGetAtt('AlarmUrl'))
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
     def test_FnGetAtt_Alarm_Url_is_cached(self):
         self.stack = self.create_stack()
 
@@ -124,30 +175,51 @@ class SignalTest(HeatTestCase):
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         first_url = rsrc.FnGetAtt('AlarmUrl')
         second_url = rsrc.FnGetAtt('AlarmUrl')
         self.assertEqual(first_url, second_url)
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
-    def test_FnGetAtt_delete_not_found(self):
+    def test_FnGetAtt_delete(self):
         self.stack = self.create_stack()
 
         self.m.ReplayAll()
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
-        rsrc.delete()
-        rsrc.resource_id = 'not-none'
-        rsrc.delete()
+        self.assertIn('http://server.test:8000/v1/signal',
+                      rsrc.FnGetAtt('AlarmUrl'))
+
+        scheduler.TaskRunner(rsrc.delete)()
+        self.assertEqual('None', rsrc.FnGetAtt('AlarmUrl'))
 
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
+    def test_delete_not_found(self):
+        self.stack = self.create_stack(stack_name='test_delete_not_found',
+                                       stub=False)
+
+        class FakeKeystoneClientFail(fakes.FakeKeystoneClient):
+            def delete_stack_user(self, name):
+                raise kc_exceptions.NotFound()
+        self.stub_keystoneclient(fake_client=FakeKeystoneClientFail())
+
+        self.m.ReplayAll()
+
+        self.stack.create()
+
+        rsrc = self.stack['signal_handler']
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
+
+        scheduler.TaskRunner(rsrc.delete)()
+        self.assertEqual((rsrc.DELETE, rsrc.COMPLETE), rsrc.state)
+
+        self.m.VerifyAll()
+
     def test_signal(self):
         test_d = {'Data': 'foo', 'Reason': 'bar',
                   'Status': 'SUCCESS', 'UniqueId': '123'}
@@ -163,20 +235,19 @@ class SignalTest(HeatTestCase):
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
         self.assertTrue(rsrc.requires_deferred_auth)
 
         rsrc.signal(details=test_d)
 
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
     def test_signal_different_reason_types(self):
         self.stack = self.create_stack()
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
         self.assertTrue(rsrc.requires_deferred_auth)
 
         ceilo_details = {'current': 'foo', 'reason': 'apples',
@@ -206,23 +277,36 @@ class SignalTest(HeatTestCase):
 
         self.m.ReplayAll()
 
-        for test_d in (ceilo_details, watch_details,
-                       str_details, none_details):
+        for test_d in (ceilo_details, watch_details, str_details,
+                       none_details):
             rsrc.signal(details=test_d)
 
         self.m.VerifyAll()
-        self.m.UnsetStubs()
 
-        # Since we unset the stubs above we must re-stub keystone to keep the
-        # test isolated from keystoneclient. The unset stubs is done so that we
-        # do not have to mock out all of the deleting that the
-        # stack_delete_after decorator will do during cleanup.
-        self.m.StubOutWithMock(self.stack.clients, 'keystone')
-        self.stack.clients.keystone().AndReturn(self.fc)
+    def test_signal_plugin_reason(self):
+        # Ensure if handle_signal returns data, we use it as the reason
+        self.stack = self.create_stack()
+        self.stack.create()
 
+        rsrc = self.stack['signal_handler']
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
+
+        self.m.StubOutWithMock(generic_resource.SignalResource,
+                               'handle_signal')
+        signal_details = {'status': 'COMPLETE'}
+        ret_expected = "Received COMPLETE signal"
+        generic_resource.SignalResource.handle_signal(
+            signal_details).AndReturn(ret_expected)
+
+        self.m.StubOutWithMock(generic_resource.SignalResource,
+                               '_add_event')
+        generic_resource.SignalResource._add_event(
+            'signal', 'COMPLETE', 'Signal: %s' % ret_expected).AndReturn(None)
         self.m.ReplayAll()
 
-    @utils.stack_delete_after
+        rsrc.signal(details=signal_details)
+        self.m.VerifyAll()
+
     def test_signal_wrong_resource(self):
         # assert that we get the correct exception when calling a
         # resource.signal() that does not have a handle_signal()
@@ -232,15 +316,14 @@ class SignalTest(HeatTestCase):
         self.stack.create()
 
         rsrc = self.stack['resource_X']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         err_metadata = {'Data': 'foo', 'Status': 'SUCCESS', 'UniqueId': '123'}
-        self.assertRaises(exception.ResourceFailure, rsrc.signal,
+        self.assertRaises(exception.ResourceActionNotSupported, rsrc.signal,
                           details=err_metadata)
 
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
     def test_signal_reception_wrong_state(self):
         # assert that we get the correct exception when calling a
         # resource.signal() that is in having a destructive action.
@@ -250,7 +333,7 @@ class SignalTest(HeatTestCase):
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
         # manually override the action to DELETE
         rsrc.action = rsrc.DELETE
 
@@ -260,7 +343,6 @@ class SignalTest(HeatTestCase):
 
         self.m.VerifyAll()
 
-    @utils.stack_delete_after
     def test_signal_reception_failed_call(self):
         # assert that we get the correct exception from resource.signal()
         # when resource.handle_signal() raises an exception.
@@ -279,7 +361,7 @@ class SignalTest(HeatTestCase):
         self.stack.create()
 
         rsrc = self.stack['signal_handler']
-        self.assertEqual(rsrc.state, (rsrc.CREATE, rsrc.COMPLETE))
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
 
         self.assertRaises(exception.ResourceFailure,
                           rsrc.signal, details=test_d)

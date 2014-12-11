@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -15,10 +14,11 @@
 
 import copy
 import json
+import six
 
+import mock
 from oslo.config import cfg
-
-cfg.CONF.import_opt('max_resources_per_stack', 'heat.common.config')
+from requests import exceptions
 
 from heat.common import exception
 from heat.common import template_format
@@ -26,10 +26,13 @@ from heat.common import urlfetch
 from heat.db import api as db_api
 from heat.engine import parser
 from heat.engine import resource
+from heat.engine import rsrc_defn
 from heat.engine import scheduler
+from heat.tests.common import HeatTestCase
 from heat.tests import generic_resource as generic_rsrc
 from heat.tests import utils
-from heat.tests.common import HeatTestCase
+
+cfg.CONF.import_opt('max_resources_per_stack', 'heat.common.config')
 
 
 class NestedStackTest(HeatTestCase):
@@ -67,20 +70,26 @@ Outputs:
     def setUp(self):
         super(NestedStackTest, self).setUp()
         self.m.StubOutWithMock(urlfetch, 'get')
-        utils.setup_dummy_db()
 
     def create_stack(self, template):
         t = template_format.parse(template)
         stack = self.parse_stack(t)
         stack.create()
-        self.assertEqual(stack.state, (stack.CREATE, stack.COMPLETE))
+        self.assertEqual((stack.CREATE, stack.COMPLETE), stack.state)
         return stack
 
-    def parse_stack(self, t):
+    def adopt_stack(self, template, adopt_data):
+        t = template_format.parse(template)
+        stack = self.parse_stack(t, adopt_data)
+        stack.adopt()
+        self.assertEqual((stack.ADOPT, stack.COMPLETE), stack.state)
+        return stack
+
+    def parse_stack(self, t, data=None):
         ctx = utils.dummy_context('test_username', 'aaaa', 'password')
         stack_name = 'test_stack'
         tmpl = parser.Template(t)
-        stack = parser.Stack(ctx, stack_name, tmpl)
+        stack = parser.Stack(ctx, stack_name, tmpl, adopt_stack_data=data)
         stack.store()
         return stack
 
@@ -92,7 +101,7 @@ Outputs:
         stack = self.create_stack(self.test_template)
         rsrc = stack['the_nested']
         nested_name = utils.PhysName(stack.name, 'the_nested')
-        self.assertEqual(nested_name, rsrc.physical_resource_name())
+        self.assertEqual(rsrc.physical_resource_name(), nested_name)
         arn_prefix = ('arn:openstack:heat::aaaa:stacks/%s/' %
                       rsrc.physical_resource_name())
         self.assertTrue(rsrc.FnGetRefId().startswith(arn_prefix))
@@ -110,6 +119,84 @@ Outputs:
 
         self.m.VerifyAll()
 
+    def test_nested_stack_adopt(self):
+        resource._register_class('GenericResource',
+                                 generic_rsrc.GenericResource)
+        urlfetch.get('https://server.test/the.template').MultipleTimes().\
+            AndReturn('''
+            HeatTemplateFormatVersion: '2012-12-12'
+            Parameters:
+              KeyName:
+                Type: String
+            Resources:
+              NestedResource:
+                Type: GenericResource
+            Outputs:
+              Foo:
+                Value: bar
+            ''')
+        self.m.ReplayAll()
+
+        adopt_data = {
+            "resources": {
+                "the_nested": {
+                    "resource_id": "test-res-id",
+                    "resources": {
+                        "NestedResource": {
+                            "resource_id": "test-nested-res-id"
+                        }
+                    }
+                }
+            }
+        }
+
+        stack = self.adopt_stack(self.test_template, adopt_data)
+        self.assertEqual((stack.ADOPT, stack.COMPLETE), stack.state)
+        rsrc = stack['the_nested']
+        self.assertEqual((rsrc.ADOPT, rsrc.COMPLETE), rsrc.state)
+        nested_name = utils.PhysName(stack.name, 'the_nested')
+        self.assertEqual(nested_name, rsrc.physical_resource_name())
+        self.assertEqual('test-nested-res-id',
+                         rsrc.nested()['NestedResource'].resource_id)
+        rsrc.delete()
+        self.m.VerifyAll()
+
+    def test_nested_stack_adopt_fail(self):
+        resource._register_class('GenericResource',
+                                 generic_rsrc.GenericResource)
+        urlfetch.get('https://server.test/the.template').MultipleTimes().\
+            AndReturn('''
+            HeatTemplateFormatVersion: '2012-12-12'
+            Parameters:
+              KeyName:
+                Type: String
+            Resources:
+              NestedResource:
+                Type: GenericResource
+            Outputs:
+              Foo:
+                Value: bar
+            ''')
+        self.m.ReplayAll()
+
+        adopt_data = {
+            "resources": {
+                "the_nested": {
+                    "resource_id": "test-res-id",
+                    "resources": {
+                    }
+                }
+            }
+        }
+
+        stack = self.adopt_stack(self.test_template, adopt_data)
+        rsrc = stack['the_nested']
+        self.assertEqual((rsrc.ADOPT, rsrc.FAILED), rsrc.nested().state)
+        nested_name = utils.PhysName(stack.name, 'the_nested')
+        self.assertEqual(nested_name, rsrc.physical_resource_name())
+        rsrc.delete()
+        self.m.VerifyAll()
+
     def test_nested_stack_create_with_timeout(self):
         urlfetch.get('https://server.test/the.template').MultipleTimes().\
             AndReturn(self.nested_template)
@@ -121,7 +208,7 @@ Outputs:
         props['TimeoutInMinutes'] = '50'
 
         stack = self.create_stack(json.dumps(timeout_template))
-        self.assertEqual(stack.state, (stack.CREATE, stack.COMPLETE))
+        self.assertEqual((stack.CREATE, stack.COMPLETE), stack.state)
         self.m.VerifyAll()
 
     def test_nested_stack_create_exceeds_resource_limit(self):
@@ -146,7 +233,7 @@ Outputs:
         t = template_format.parse(self.test_template)
         stack = self.parse_stack(t)
         stack.create()
-        self.assertEqual(stack.state, (stack.CREATE, stack.FAILED))
+        self.assertEqual((stack.CREATE, stack.FAILED), stack.state)
         self.assertIn('Maximum resources per stack exceeded',
                       stack.status_reason)
 
@@ -174,7 +261,7 @@ Outputs:
         t = template_format.parse(self.test_template)
         stack = self.parse_stack(t)
         stack.create()
-        self.assertEqual(stack.state, (stack.CREATE, stack.COMPLETE))
+        self.assertEqual((stack.CREATE, stack.COMPLETE), stack.state)
         self.assertIn('NestedResource',
                       stack['the_nested'].nested())
 
@@ -192,14 +279,13 @@ Outputs:
         rsrc = stack['the_nested']
 
         original_nested_id = rsrc.resource_id
-        t = template_format.parse(self.test_template)
-        new_res = copy.deepcopy(t['Resources']['the_nested'])
-        new_res['Properties']['TemplateURL'] = (
-            'https://server.test/new.template')
         prop_diff = {'TemplateURL': 'https://server.test/new.template'}
+        props = copy.copy(rsrc.properties.data)
+        props.update(prop_diff)
+        new_res = rsrc_defn.ResourceDefinition(rsrc.name, rsrc.type(), props)
         updater = rsrc.handle_update(new_res, {}, prop_diff)
         updater.run_to_completion()
-        self.assertEqual(True, rsrc.check_update_complete(updater))
+        self.assertIs(True, rsrc.check_update_complete(updater))
 
         # Expect the physical resource name staying the same after update,
         # so that the nested was actually updated instead of replaced.
@@ -247,15 +333,13 @@ Outputs:
 
         rsrc = stack['the_nested']
 
-        original_nested_id = rsrc.resource_id
-        t = template_format.parse(self.test_template)
-        new_res = copy.deepcopy(t['Resources']['the_nested'])
-        new_res['Properties']['TemplateURL'] = (
-            'https://server.test/new.template')
         prop_diff = {'TemplateURL': 'https://server.test/new.template'}
+        props = copy.copy(rsrc.properties.data)
+        props.update(prop_diff)
+        new_res = rsrc_defn.ResourceDefinition(rsrc.name, rsrc.type(), props)
         updater = rsrc.handle_update(new_res, {}, prop_diff)
         updater.run_to_completion()
-        self.assertEqual(True, rsrc.check_update_complete(updater))
+        self.assertIs(True, rsrc.check_update_complete(updater))
 
         self.assertEqual('foo', rsrc.FnGetAtt('Outputs.Bar'))
 
@@ -289,16 +373,14 @@ Outputs:
 
         rsrc = stack['the_nested']
 
-        original_nested_id = rsrc.resource_id
-        t = template_format.parse(self.test_template)
-        new_res = copy.deepcopy(t['Resources']['the_nested'])
-        new_res['Properties']['TemplateURL'] = (
-            'https://server.test/new.template')
         prop_diff = {'TemplateURL': 'https://server.test/new.template'}
+        props = copy.copy(rsrc.properties.data)
+        props.update(prop_diff)
+        new_res = rsrc_defn.ResourceDefinition(rsrc.name, rsrc.type(), props)
         ex = self.assertRaises(exception.RequestLimitExceeded,
                                rsrc.handle_update, new_res, {}, prop_diff)
         self.assertIn(exception.StackResourceLimitExceeded.msg_fmt,
-                      str(ex))
+                      six.text_type(ex))
         rsrc.delete()
 
         self.m.VerifyAll()
@@ -312,17 +394,17 @@ Outputs:
         rsrc = stack['the_nested']
 
         scheduler.TaskRunner(rsrc.suspend)()
-        self.assertEqual(rsrc.state, (rsrc.SUSPEND, rsrc.COMPLETE))
+        self.assertEqual((rsrc.SUSPEND, rsrc.COMPLETE), rsrc.state)
 
         scheduler.TaskRunner(rsrc.resume)()
-        self.assertEqual(rsrc.state, (rsrc.RESUME, rsrc.COMPLETE))
+        self.assertEqual((rsrc.RESUME, rsrc.COMPLETE), rsrc.state)
 
         rsrc.delete()
         self.m.VerifyAll()
 
     def test_nested_stack_three_deep(self):
         root_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -330,7 +412,7 @@ Resources:
             TemplateURL: 'https://server.test/depth1.template'
 '''
         depth1_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -338,7 +420,7 @@ Resources:
             TemplateURL: 'https://server.test/depth2.template'
 '''
         depth2_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -362,7 +444,7 @@ Resources:
 
     def test_nested_stack_four_deep(self):
         root_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -370,7 +452,7 @@ Resources:
             TemplateURL: 'https://server.test/depth1.template'
 '''
         depth1_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -378,7 +460,7 @@ Resources:
             TemplateURL: 'https://server.test/depth2.template'
 '''
         depth2_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -386,7 +468,7 @@ Resources:
             TemplateURL: 'https://server.test/depth3.template'
 '''
         depth3_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -417,7 +499,7 @@ Resources:
 
     def test_nested_stack_four_wide(self):
         root_template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -462,7 +544,7 @@ Resources:
 
     def test_nested_stack_infinite_recursion(self):
         template = '''
-HeatTemplateFormat: 2012-12-12
+HeatTemplateFormatVersion: 2012-12-12
 Resources:
     Nested:
         Type: AWS::CloudFormation::Stack
@@ -476,14 +558,86 @@ Resources:
         t = template_format.parse(template)
         stack = self.parse_stack(t)
         stack.create()
-        self.assertEqual(stack.state, (stack.CREATE, stack.FAILED))
+        self.assertEqual((stack.CREATE, stack.FAILED), stack.state)
         self.assertIn('Recursion depth exceeds', stack.status_reason)
         self.m.VerifyAll()
+
+    def test_nested_stack_delete(self):
+        urlfetch.get('https://server.test/the.template').MultipleTimes().\
+            AndReturn(self.nested_template)
+        self.m.ReplayAll()
+
+        stack = self.create_stack(self.test_template)
+        rsrc = stack['the_nested']
+        scheduler.TaskRunner(rsrc.delete)()
+        self.assertEqual((stack.DELETE, stack.COMPLETE), rsrc.state)
+
+        nested_stack = parser.Stack.load(utils.dummy_context(
+            'test_username', 'aaaa', 'password'), rsrc.resource_id)
+        self.assertEqual((stack.DELETE, stack.COMPLETE), nested_stack.state)
+
+        self.m.VerifyAll()
+
+    def test_nested_stack_delete_then_delete_parent_stack(self):
+        urlfetch.get('https://server.test/the.template').MultipleTimes().\
+            AndReturn(self.nested_template)
+        self.m.ReplayAll()
+
+        stack = self.create_stack(self.test_template)
+        rsrc = stack['the_nested']
+
+        nested_stack = parser.Stack.load(utils.dummy_context(
+            'test_username', 'aaaa', 'password'), rsrc.resource_id)
+        nested_stack.delete()
+
+        stack = parser.Stack.load(utils.dummy_context(
+            'test_username', 'aaaa', 'password'), stack.id)
+        stack.delete()
+        self.assertEqual((stack.DELETE, stack.COMPLETE), stack.state)
+
+        self.m.VerifyAll()
+
+    def test_child_params(self):
+        t = template_format.parse(self.test_template)
+        stack = self.parse_stack(t)
+        nested_stack = stack['the_nested']
+        nested_stack.properties.data[nested_stack.PARAMETERS] = {'foo': 'bar'}
+
+        self.assertEqual({'foo': 'bar'}, nested_stack.child_params())
+
+    @mock.patch.object(urlfetch, 'get')
+    def test_child_template_when_file_is_fetched(self, mock_get):
+        mock_get.return_value = 'template_file'
+        t = template_format.parse(self.test_template)
+        stack = self.parse_stack(t)
+        nested_stack = stack['the_nested']
+
+        with mock.patch('heat.common.template_format.parse') as mock_parse:
+            mock_parse.return_value = 'child_template'
+            self.assertEqual('child_template', nested_stack.child_template())
+            mock_parse.assert_called_once_with('template_file')
+
+    @mock.patch.object(urlfetch, 'get')
+    def test_child_template_when_fetching_file_fails(self, mock_get):
+        mock_get.side_effect = exceptions.RequestException()
+        t = template_format.parse(self.test_template)
+        stack = self.parse_stack(t)
+        nested_stack = stack['the_nested']
+        self.assertRaises(ValueError, nested_stack.child_template)
+
+    @mock.patch.object(urlfetch, 'get')
+    def test_child_template_when_io_error(self, mock_get):
+        msg = 'Failed to retrieve template'
+        mock_get.side_effect = urlfetch.URLFetchError(msg)
+        t = template_format.parse(self.test_template)
+        stack = self.parse_stack(t)
+        nested_stack = stack['the_nested']
+        self.assertRaises(ValueError, nested_stack.child_template)
 
 
 class ResDataResource(generic_rsrc.GenericResource):
     def handle_create(self):
-        db_api.resource_data_set(self, "test", 'A secret value', True)
+        self.data_set("test", 'A secret value', True)
 
 
 class ResDataNestedStackTest(NestedStackTest):
@@ -512,6 +666,6 @@ Outputs:
         stack = self.create_stack(self.test_template)
         res = stack['the_nested'].nested()['nested_res']
         stack.delete()
-        self.assertEqual(stack.state, (stack.DELETE, stack.COMPLETE))
+        self.assertEqual((stack.DELETE, stack.COMPLETE), stack.state)
         self.assertRaises(exception.NotFound, db_api.resource_data_get, res,
                           'test')

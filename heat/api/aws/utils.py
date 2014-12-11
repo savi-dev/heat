@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -17,10 +15,11 @@
 Helper utilities related to the AWS API implementations
 '''
 
-import re
 import itertools
-from heat.api.aws import exception
+import re
 
+from heat.api.aws import exception
+from heat.common.i18n import _LE
 from heat.openstack.common import log as logging
 
 LOG = logging.getLogger(__name__)
@@ -103,13 +102,15 @@ def get_param_value(params, key):
     try:
         return params[key]
     except KeyError:
-        LOG.error("Request does not contain %s parameter!" % key)
+        LOG.error(_LE("Request does not contain %s parameter!"), key)
         raise exception.HeatMissingParameterError(key)
 
 
-def reformat_dict_keys(keymap={}, inputdict={}):
+def reformat_dict_keys(keymap=None, inputdict=None):
     '''
     Utility function for mapping one dict format to another
     '''
+    keymap = keymap or {}
+    inputdict = inputdict or {}
     return dict([(outk, inputdict[ink]) for ink, outk in keymap.items()
                 if ink in inputdict])

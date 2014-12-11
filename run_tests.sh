@@ -11,7 +11,8 @@ function usage {
     echo "  -F, --force              Force a clean re-build of the virtual environment. Useful when dependencies have been added."
     echo "  -f, --func               Functional tests have been removed."
     echo "  -u, --unit               Run unit tests (default when nothing specified)"
-    echo "  -p, --pep8               Run pep8 tests"
+    echo "  -p, --pep8               Run flake8 and HACKING compliance check (default when nothing specified)"
+    echo "  -P, --no-pep8            Don't run flake8 and HACKING compliance check"
     echo "  --all                    Run pep8 and unit tests"
     echo "  -c, --coverage           Generate coverage report"
     echo "  -d, --debug              Run tests with testtools instead of testr. This allows you to use the debugger."
@@ -28,6 +29,7 @@ function process_option {
         -f|--func) test_func=1;;
         -u|--unit) test_unit=1;;
         -p|--pep8) test_pep8=1;;
+        -P|--no-pep8) test_pep8=0;;
         --all) test_unit=1; test_pep8=1;;
         -c|--coverage) coverage=1;;
         -d|--debug) debug=1;;
@@ -40,6 +42,7 @@ venv=.venv
 with_venv=tools/with_venv.sh
 wrapper=""
 debug=0
+flake8args="heat bin/heat-api bin/heat-api-cfn bin/heat-api-cloudwatch bin/heat-engine bin/heat-manage contrib"
 
 function run_tests {
     echo 'Running tests'
@@ -65,12 +68,12 @@ function run_tests {
     if [ -n "$args" ] ; then
         args="-t $args"
     fi
-    python setup.py testr --slowest $args
+    ${wrapper} python setup.py testr --slowest $args
 }
 
 function run_pep8 {
     echo "Running flake8..."
-    bash -c "${wrapper} flake8"
+    bash -c "${wrapper} flake8 ${flake8args}"
 }
 
 # run unit tests with pep8 when no arguments are specified
@@ -116,8 +119,8 @@ fi
 # Generate coverage report
 if [ "$coverage" == 1 ]; then
     echo "Generating coverage report in ./cover"
-    python setup.py testr --coverage --slowest
-    python -m coverage report --show-missing
+    ${wrapper} python setup.py testr --coverage --slowest
+    ${wrapper} python -m coverage report --show-missing
 fi
 
 exit $result

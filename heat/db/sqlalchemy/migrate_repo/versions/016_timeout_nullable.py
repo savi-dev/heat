@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -28,4 +27,7 @@ def downgrade(migrate_engine):
     meta.bind = migrate_engine
 
     stack = sqlalchemy.Table('stack', meta, autoload=True)
+    # NOTE(viktors): We must be sure, that there are no nullable columns in
+    #                `stack` table before we alter it.
+    migrate_engine.execute('UPDATE stack set timeout=60 WHERE timeout IS NULL')
     stack.c.timeout.alter(nullable=False)

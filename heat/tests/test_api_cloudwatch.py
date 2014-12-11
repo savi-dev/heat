@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -16,12 +15,12 @@ import os
 
 from oslo.config import cfg
 
-from heat.common import policy
-from heat.openstack.common import rpc
-from heat.common.wsgi import Request
 from heat.api.aws import exception
 import heat.api.cloudwatch.watch as watches
+from heat.common import policy
+from heat.common.wsgi import Request
 from heat.rpc import api as engine_api
+from heat.rpc import client as rpc_client
 from heat.tests.common import HeatTestCase
 from heat.tests import utils
 
@@ -32,8 +31,9 @@ class WatchControllerTest(HeatTestCase):
     the endpoint processing API requests after they are routed
     '''
 
-    def _dummy_GET_request(self, params={}):
+    def _dummy_GET_request(self, params=None):
         # Mangle the params dict into a query string
+        params = params or {}
         qs = "&".join(["=".join([k, str(params[k])]) for k in params])
         environ = {'REQUEST_METHOD': 'GET', 'QUERY_STRING': qs}
         req = Request(environ)
@@ -57,7 +57,7 @@ class WatchControllerTest(HeatTestCase):
         dummy_req = self._dummy_GET_request(params)
         self.controller.policy.policy_path = None
         response = self.controller._enforce(dummy_req, 'ListMetrics')
-        self.assertEqual(response, None)
+        self.assertIsNone(response)
         self.m.VerifyAll()
 
     def test_enforce_denied(self):
@@ -77,7 +77,7 @@ class WatchControllerTest(HeatTestCase):
         dummy_req.context.roles = ['heat_stack_user']
 
         self.m.StubOutWithMock(policy.Enforcer, 'enforce')
-        policy.Enforcer.enforce(dummy_req.context, 'ListMetrics', {}
+        policy.Enforcer.enforce(dummy_req.context, 'ListMetrics'
                                 ).AndRaise(AttributeError)
         self.m.ReplayAll()
 
@@ -92,14 +92,14 @@ class WatchControllerTest(HeatTestCase):
         params = {'Action': 'DeleteAlarms'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.delete_alarms(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_describe_alarm_history(self):
         # Not yet implemented, should raise HeatAPINotImplementedError
         params = {'Action': 'DescribeAlarmHistory'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.describe_alarm_history(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_describe_all(self):
         watch_name = None   # Get all watches
@@ -132,13 +132,11 @@ class WatchControllerTest(HeatTestCase):
                         u'name': u'HttpFailureAlarm',
                         u'updated_time': u'2012-08-30T14:10:46Z'}]
 
-        self.m.StubOutWithMock(rpc, 'call')
-        rpc.call(dummy_req.context, self.topic,
-                 {'namespace': None,
-                  'args': {'watch_name': watch_name},
-                  'method': 'show_watch',
-                  'version': self.api_version},
-                 None).AndReturn(engine_resp)
+        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
+        rpc_client.EngineClient.call(
+            dummy_req.context,
+            ('show_watch', {'watch_name': watch_name})
+        ).AndReturn(engine_resp)
 
         self.m.ReplayAll()
 
@@ -178,28 +176,28 @@ class WatchControllerTest(HeatTestCase):
         params = {'Action': 'DescribeAlarmsForMetric'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.describe_alarms_for_metric(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_disable_alarm_actions(self):
         # Not yet implemented, should raise HeatAPINotImplementedError
         params = {'Action': 'DisableAlarmActions'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.disable_alarm_actions(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_enable_alarm_actions(self):
         # Not yet implemented, should raise HeatAPINotImplementedError
         params = {'Action': 'EnableAlarmActions'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.enable_alarm_actions(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_get_metric_statistics(self):
         # Not yet implemented, should raise HeatAPINotImplementedError
         params = {'Action': 'GetMetricStatistics'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.get_metric_statistics(dummy_req)
-        self.assertEqual(exception.HeatAPINotImplementedError, type(result))
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_list_metrics_all(self):
         params = {'Action': 'ListMetrics'}
@@ -226,16 +224,15 @@ class WatchControllerTest(HeatTestCase):
                         u'metric_name': u'ServiceFailure3',
                         u'data': {u'Units': u'Counter', u'Value': 1}}]
 
-        self.m.StubOutWithMock(rpc, 'call')
+        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
         # Current engine implementation means we filter in the API
         # and pass None/None for namespace/watch_name which returns
         # all metric data which we post-process in the API
-        rpc.call(dummy_req.context, self.topic,
-                 {'namespace': None,
-                  'args': {'metric_namespace': None, 'metric_name': None},
-                  'method': 'show_watch_metric',
-                  'version': self.api_version},
-                 None).AndReturn(engine_resp)
+        rpc_client.EngineClient.call(
+            dummy_req.context,
+            ('show_watch_metric',
+             {'metric_namespace': None, 'metric_name': None})
+        ).AndReturn(engine_resp)
 
         self.m.ReplayAll()
 
@@ -306,17 +303,15 @@ class WatchControllerTest(HeatTestCase):
                         u'metric_name': u'ServiceFailure3',
                         u'data': {u'Units': u'Counter', u'Value': 1}}]
 
-        self.m.StubOutWithMock(rpc, 'call')
+        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
         # Current engine implementation means we filter in the API
         # and pass None/None for namespace/watch_name which returns
         # all metric data which we post-process in the API
-        rpc.call(dummy_req.context, self.topic, {'args':
-                 {'metric_namespace': None,
-                  'metric_name': None},
-                 'namespace': None,
-                 'method': 'show_watch_metric',
-                 'version': self.api_version},
-                 None).AndReturn(engine_resp)
+        rpc_client.EngineClient.call(
+            dummy_req.context,
+            ('show_watch_metric',
+             {'metric_namespace': None, 'metric_name': None})
+        ).AndReturn(engine_resp)
 
         self.m.ReplayAll()
 
@@ -340,7 +335,7 @@ class WatchControllerTest(HeatTestCase):
     def test_list_metrics_filter_namespace(self):
 
         # Add a Namespace filter and change the engine response so
-        # we should get two reponses
+        # we should get two responses
         params = {'Action': 'ListMetrics',
                   'Namespace': 'atestnamespace/foo'}
         dummy_req = self._dummy_GET_request(params)
@@ -366,16 +361,15 @@ class WatchControllerTest(HeatTestCase):
                         u'metric_name': u'ServiceFailure3',
                         u'data': {u'Units': u'Counter', u'Value': 1}}]
 
-        self.m.StubOutWithMock(rpc, 'call')
+        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
         # Current engine implementation means we filter in the API
         # and pass None/None for namespace/watch_name which returns
         # all metric data which we post-process in the API
-        rpc.call(dummy_req.context, self.topic,
-                 {'args': {'metric_namespace': None, 'metric_name': None},
-                  'namespace': None,
-                  'method': 'show_watch_metric',
-                  'version': self.api_version},
-                 None).AndReturn(engine_resp)
+        rpc_client.EngineClient.call(
+            dummy_req.context,
+            ('show_watch_metric',
+             {'metric_namespace': None, 'metric_name': None})
+        ).AndReturn(engine_resp)
 
         self.m.ReplayAll()
 
@@ -411,7 +405,7 @@ class WatchControllerTest(HeatTestCase):
         params = {'Action': 'PutMetricAlarm'}
         dummy_req = self._dummy_GET_request(params)
         result = self.controller.put_metric_alarm(dummy_req)
-        self.assertEqual(type(result), exception.HeatAPINotImplementedError)
+        self.assertIsInstance(result, exception.HeatAPINotImplementedError)
 
     def test_put_metric_data(self):
 
@@ -430,20 +424,16 @@ class WatchControllerTest(HeatTestCase):
         # Stub out the RPC call to verify the engine call parameters
         engine_resp = {}
 
-        self.m.StubOutWithMock(rpc, 'call')
-        rpc.call(dummy_req.context, self.topic,
-                 {'args':
-                  {'stats_data':
-                      {'Namespace': u'system/linux',
-                       u'ServiceFailure':
-                       {'Value': u'1',
-                        'Unit': u'Count',
-                        'Dimensions': []}},
-                   'watch_name': u'HttpFailureAlarm'},
-                  'namespace': None,
-                  'method': 'create_watch_data',
-                  'version': self.api_version},
-                 None).AndReturn(engine_resp)
+        self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
+        rpc_client.EngineClient.call(
+            dummy_req.context,
+            ('create_watch_data',
+             {'watch_name': u'HttpFailureAlarm',
+              'stats_data': {
+                  'Namespace': u'system/linux',
+                  'ServiceFailure': {
+                      'Value': u'1', 'Unit': u'Count', 'Dimensions': []}}})
+        ).AndReturn(engine_resp)
 
         self.m.ReplayAll()
 
@@ -470,15 +460,13 @@ class WatchControllerTest(HeatTestCase):
             # of the response at present we pass nothing back from the stub
             engine_resp = {}
 
-            self.m.StubOutWithMock(rpc, 'call')
-            rpc.call(dummy_req.context, self.topic,
-                     {'args':
-                      {'state': state_map[state],
-                       'watch_name': u'HttpFailureAlarm'},
-                      'namespace': None,
-                      'method': 'set_watch_state',
-                      'version': self.api_version},
-                     None).AndReturn(engine_resp)
+            self.m.StubOutWithMock(rpc_client.EngineClient, 'call')
+            rpc_client.EngineClient.call(
+                dummy_req.context,
+                ('set_watch_state',
+                 {'state': state_map[state],
+                  'watch_name': u'HttpFailureAlarm'})
+            ).AndReturn(engine_resp)
 
             self.m.ReplayAll()
 
@@ -498,8 +486,7 @@ class WatchControllerTest(HeatTestCase):
 
         # should raise HeatInvalidParameterValueError
         result = self.controller.set_alarm_state(dummy_req)
-        self.assertEqual(exception.HeatInvalidParameterValueError,
-                         type(result))
+        self.assertIsInstance(result, exception.HeatInvalidParameterValueError)
 
     def setUp(self):
         super(WatchControllerTest, self).setUp()
@@ -516,7 +503,7 @@ class WatchControllerTest(HeatTestCase):
         self.api_version = '1.0'
 
         # Create WSGI controller instance
-        class DummyConfig():
+        class DummyConfig(object):
             bind_port = 8003
         cfgopts = DummyConfig()
         self.controller = watches.WatchController(options=cfgopts)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,21 +10,22 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
+import os.path
+import sys
+
 import fixtures
 import mock
-import os.path
-
 from oslo.config import cfg
-
-cfg.CONF.import_opt('environment_dir', 'heat.common.config')
+import six
 
 from heat.common import environment_format
-
 from heat.engine import environment
 from heat.engine import resources
-
-from heat.tests import generic_resource
 from heat.tests import common
+from heat.tests import generic_resource
+
+cfg.CONF.import_opt('environment_dir', 'heat.common.config')
 
 
 class EnvironmentTest(common.HeatTestCase):
@@ -48,14 +47,67 @@ class EnvironmentTest(common.HeatTestCase):
         env = environment.Environment(new_env)
         self.assertEqual(new_env, env.user_env_as_dict())
 
+    def test_existing_parameters(self):
+        # This tests reusing the existing parameters as is
+        prev_params = {'foo': 'bar', 'tester': 'Yes'}
+        params = {}
+        expected = {'parameters': prev_params,
+                    'resource_registry': {'resources': {}}}
+        prev_env = environment.Environment(
+            {'parameters': prev_params,
+             'resource_registry': {'resources': {}}})
+        env = environment.Environment(params)
+        env.patch_previous_parameters(prev_env)
+        self.assertEqual(expected, env.user_env_as_dict())
+
+    def test_patch_existing_parameters(self):
+        # This tests patching cli parameters over the existing parameters
+        prev_params = {'foo': 'bar', 'tester': 'Yes'}
+        params = {'tester': 'patched'}
+        expected = {'parameters': {'foo': 'bar', 'tester': 'patched'},
+                    'resource_registry': {'resources': {}}}
+        prev_env = environment.Environment(
+            {'parameters': prev_params,
+             'resource_registry': {'resources': {}}})
+        env = environment.Environment(params)
+        env.patch_previous_parameters(prev_env)
+        self.assertEqual(expected, env.user_env_as_dict())
+
+    def test_patch_and_clear_existing_parameters(self):
+        # This tests patching cli parameters over the existing parameters
+        prev_params = {'foo': 'bar', 'tester': 'Yes',
+                       'another_tester': 'Yes'}
+        params = {'tester': 'patched'}
+        expected = {'parameters': {'foo': 'bar', 'tester': 'patched'},
+                    'resource_registry': {'resources': {}}}
+        prev_env = environment.Environment(
+            {'parameters': prev_params,
+             'resource_registry': {'resources': {}}})
+        env = environment.Environment(params)
+        env.patch_previous_parameters(prev_env, ['another_tester'])
+        self.assertEqual(expected, env.user_env_as_dict())
+
+    def test_clear_existing_parameters(self):
+        # This tests removing some parameters in the existing set of parameters
+        prev_params = {'foo': 'bar', 'tester': 'Yes'}
+        params = {}
+        expected = {'parameters': {'foo': 'bar'},
+                    'resource_registry': {'resources': {}}}
+        prev_env = environment.Environment(
+            {'parameters': prev_params,
+             'resource_registry': {'resources': {}}})
+        env = environment.Environment(params)
+        env.patch_previous_parameters(prev_env, ['tester'])
+        self.assertEqual(expected, env.user_env_as_dict())
+
     def test_global_registry(self):
-        self.g_env.register_class('CloudX::Compute::Server',
+        self.g_env.register_class('CloudX::Nova::Server',
                                   generic_resource.GenericResource)
         new_env = {u'parameters': {u'a': u'ff', u'b': u'ss'},
                    u'resource_registry': {u'OS::*': 'CloudX::*'}}
         env = environment.Environment(new_env)
-        self.assertEqual('CloudX::Compute::Server',
-                         env.get_resource_info('OS::Compute::Server',
+        self.assertEqual('CloudX::Nova::Server',
+                         env.get_resource_info('OS::Nova::Server',
                                                'my_db_server').name)
 
     def test_map_one_resource_type(self):
@@ -97,62 +149,160 @@ class EnvironmentTest(common.HeatTestCase):
             u'OS::Networking::FloatingIP': 'ip.yaml'}}}}
 
         env = environment.Environment()
-        self.assertEqual(None,
-                         env.get_resource_info('OS::Networking::FloatingIP',
-                                               'my_fip'))
+        self.assertIsNone(env.get_resource_info('OS::Networking::FloatingIP',
+                                                'my_fip'))
 
         env.load(new_env)
         self.assertEqual('ip.yaml',
                          env.get_resource_info('OS::Networking::FloatingIP',
                                                'my_fip').value)
 
+    def test_constraints(self):
+        env = environment.Environment({})
+
+        first_constraint = object()
+        second_constraint = object()
+        env.register_constraint("constraint1", first_constraint)
+        env.register_constraint("constraint2", second_constraint)
+        self.assertIs(first_constraint, env.get_constraint("constraint1"))
+        self.assertIs(second_constraint, env.get_constraint("constraint2"))
+        self.assertIs(None, env.get_constraint("no_constraint"))
+
+    def test_constraints_registry(self):
+        constraint_content = '''
+class MyConstraint(object):
+    pass
+
+def constraint_mapping():
+    return {"constraint1": MyConstraint}
+        '''
+        plugin_dir = self.useFixture(fixtures.TempDir())
+        plugin_file = os.path.join(plugin_dir.path, 'test.py')
+        with open(plugin_file, 'w+') as ef:
+            ef.write(constraint_content)
+        self.addCleanup(sys.modules.pop, "heat.engine.plugins.test")
+        cfg.CONF.set_override('plugin_dirs', plugin_dir.path)
+
+        env = environment.Environment({})
+        resources._load_global_environment(env)
+
+        self.assertEqual("MyConstraint",
+                         env.get_constraint("constraint1").__name__)
+        self.assertIs(None, env.get_constraint("no_constraint"))
+
+    def test_constraints_registry_error(self):
+        constraint_content = '''
+def constraint_mapping():
+    raise ValueError("oops")
+        '''
+        plugin_dir = self.useFixture(fixtures.TempDir())
+        plugin_file = os.path.join(plugin_dir.path, 'test.py')
+        with open(plugin_file, 'w+') as ef:
+            ef.write(constraint_content)
+        self.addCleanup(sys.modules.pop, "heat.engine.plugins.test")
+        cfg.CONF.set_override('plugin_dirs', plugin_dir.path)
+
+        env = environment.Environment({})
+        error = self.assertRaises(ValueError,
+                                  resources._load_global_environment, env)
+        self.assertEqual("oops", six.text_type(error))
+
+    def test_constraints_registry_stevedore(self):
+        env = environment.Environment({})
+        resources._load_global_environment(env)
+
+        self.assertEqual("FlavorConstraint",
+                         env.get_constraint("nova.flavor").__name__)
+        self.assertIs(None, env.get_constraint("no_constraint"))
+
+
+class EnvironmentDuplicateTest(common.HeatTestCase):
+
+    scenarios = [
+        ('same', dict(resource_type='test.yaml',
+                      expected_equal=True)),
+        ('diff_temp', dict(resource_type='not.yaml',
+                           expected_equal=False)),
+        ('diff_map', dict(resource_type='OS::SomethingElse',
+                          expected_equal=False)),
+        ('diff_path', dict(resource_type='a/test.yaml',
+                           expected_equal=False)),
+    ]
+
+    def test_env_load(self):
+        env_initial = {u'resource_registry': {
+            u'OS::Test::Dummy': 'test.yaml'}}
+
+        env = environment.Environment()
+        env.load(env_initial)
+        info = env.get_resource_info('OS::Test::Dummy', 'something')
+        replace_log = 'Changing %s from %s to %s' % ('OS::Test::Dummy',
+                                                     'test.yaml',
+                                                     self.resource_type)
+        self.assertNotIn(replace_log, self.LOG.output)
+        env_test = {u'resource_registry': {
+            u'OS::Test::Dummy': self.resource_type}}
+        env.load(env_test)
+
+        if self.expected_equal:
+            # should return exactly the same object.
+            self.assertIs(info, env.get_resource_info('OS::Test::Dummy',
+                                                      'my_fip'))
+            self.assertNotIn(replace_log, self.LOG.output)
+        else:
+            self.assertIn(replace_log, self.LOG.output)
+            self.assertNotEqual(info,
+                                env.get_resource_info('OS::Test::Dummy',
+                                                      'my_fip'))
+
 
 class GlobalEnvLoadingTest(common.HeatTestCase):
 
     def test_happy_path(self):
-        list_dir = 'heat.engine.resources._list_environment_files'
-        with mock.patch(list_dir) as m_ldir:
-            m_ldir.return_value = ['a.yaml']
-            env_dir = '/etc_etc/heat/enviroment.d'
+        with mock.patch('glob.glob') as m_ldir:
+            m_ldir.return_value = ['/etc_etc/heat/environment.d/a.yaml']
+            env_dir = '/etc_etc/heat/environment.d'
             env_content = '{"resource_registry": {}}'
 
-            with mock.patch('heat.engine.resources.open',
+            env = environment.Environment({}, user_env=False)
+
+            with mock.patch('heat.engine.environment.open',
                             mock.mock_open(read_data=env_content),
                             create=True) as m_open:
-                resources._load_global_environment(resources.global_env(),
-                                                   env_dir)
+                environment.read_global_environment(env, env_dir)
 
-        m_ldir.assert_called_once_with(env_dir)
+        m_ldir.assert_called_once_with(env_dir + '/*')
         m_open.assert_called_once_with('%s/a.yaml' % env_dir)
 
     def test_empty_env_dir(self):
-        list_dir = 'heat.engine.resources._list_environment_files'
-        with mock.patch(list_dir) as m_ldir:
+        with mock.patch('glob.glob') as m_ldir:
             m_ldir.return_value = []
-            env_dir = '/etc_etc/heat/enviroment.d'
-            resources._load_global_environment(resources.global_env(),
-                                               env_dir)
+            env_dir = '/etc_etc/heat/environment.d'
 
-        m_ldir.assert_called_once_with(env_dir)
+            env = environment.Environment({}, user_env=False)
+            environment.read_global_environment(env, env_dir)
+
+        m_ldir.assert_called_once_with(env_dir + '/*')
 
     def test_continue_on_ioerror(self):
         """assert we get all files processed even if there are
         processing exceptions.
         """
-        list_dir = 'heat.engine.resources._list_environment_files'
-        with mock.patch(list_dir) as m_ldir:
-            m_ldir.return_value = ['a.yaml', 'b.yaml']
-            env_dir = '/etc_etc/heat/enviroment.d'
+        with mock.patch('glob.glob') as m_ldir:
+            m_ldir.return_value = ['/etc_etc/heat/environment.d/a.yaml',
+                                   '/etc_etc/heat/environment.d/b.yaml']
+            env_dir = '/etc_etc/heat/environment.d'
             env_content = '{}'
 
-            with mock.patch('heat.engine.resources.open',
+            env = environment.Environment({}, user_env=False)
+
+            with mock.patch('heat.engine.environment.open',
                             mock.mock_open(read_data=env_content),
                             create=True) as m_open:
                 m_open.side_effect = IOError
-                resources._load_global_environment(resources.global_env(),
-                                                   env_dir)
+                environment.read_global_environment(env, env_dir)
 
-        m_ldir.assert_called_once_with(env_dir)
+        m_ldir.assert_called_once_with(env_dir + '/*')
         expected = [mock.call('%s/a.yaml' % env_dir),
                     mock.call('%s/b.yaml' % env_dir)]
         self.assertEqual(expected, m_open.call_args_list)
@@ -161,19 +311,20 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
         """assert we get all files processed even if there are
         processing exceptions.
         """
-        list_dir = 'heat.engine.resources._list_environment_files'
-        with mock.patch(list_dir) as m_ldir:
-            m_ldir.return_value = ['a.yaml', 'b.yaml']
-            env_dir = '/etc_etc/heat/enviroment.d'
+        with mock.patch('glob.glob') as m_ldir:
+            m_ldir.return_value = ['/etc_etc/heat/environment.d/a.yaml',
+                                   '/etc_etc/heat/environment.d/b.yaml']
+            env_dir = '/etc_etc/heat/environment.d'
             env_content = '{@$%#$%'
 
-            with mock.patch('heat.engine.resources.open',
+            env = environment.Environment({}, user_env=False)
+
+            with mock.patch('heat.engine.environment.open',
                             mock.mock_open(read_data=env_content),
                             create=True) as m_open:
-                resources._load_global_environment(resources.global_env(),
-                                                   env_dir)
+                environment.read_global_environment(env, env_dir)
 
-        m_ldir.assert_called_once_with(env_dir)
+        m_ldir.assert_called_once_with(env_dir + '/*')
         expected = [mock.call('%s/a.yaml' % env_dir),
                     mock.call('%s/b.yaml' % env_dir)]
         self.assertEqual(expected, m_open.call_args_list)
@@ -197,7 +348,7 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
-        resources._load_all(g_env)
+        resources._load_global_environment(g_env)
 
         # 3. assert our resource is in place.
         self.assertEqual('file:///not_really_here.yaml',
@@ -219,11 +370,10 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
-        resources._load_all(g_env)
+        resources._load_global_environment(g_env)
 
         # 3. assert our resource is in now gone.
-        self.assertEqual(None,
-                         g_env.get_resource_info('OS::Nova::Server'))
+        self.assertIsNone(g_env.get_resource_info('OS::Nova::Server'))
 
         # 4. make sure we haven't removed something we shouldn't have
         self.assertEqual(resources.instance.Instance,
@@ -245,11 +395,10 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
 
         # 2. load global env
         g_env = environment.Environment({}, user_env=False)
-        resources._load_all(g_env)
+        resources._load_global_environment(g_env)
 
         # 3. assert our resources are now gone.
-        self.assertEqual(None,
-                         g_env.get_resource_info('AWS::EC2::Instance'))
+        self.assertIsNone(g_env.get_resource_info('AWS::EC2::Instance'))
 
         # 4. make sure we haven't removed something we shouldn't have
         self.assertEqual(resources.server.Server,
@@ -270,3 +419,34 @@ class GlobalEnvLoadingTest(common.HeatTestCase):
         self.assertEqual(
             resources.instance.Instance,
             u_env.get_resource_info('AWS::EC2::Instance').value)
+
+    def test_env_ignore_files_starting_dot(self):
+        # prove we can disable a resource in the global environment
+
+        g_env_content = ''
+        # 1. fake an environment file
+        envdir = self.useFixture(fixtures.TempDir())
+        with open(os.path.join(envdir.path, 'a.yaml'), 'w+') as ef:
+            ef.write(g_env_content)
+        with open(os.path.join(envdir.path, '.test.yaml'), 'w+') as ef:
+            ef.write(g_env_content)
+        with open(os.path.join(envdir.path, 'b.yaml'), 'w+') as ef:
+            ef.write(g_env_content)
+        cfg.CONF.set_override('environment_dir', envdir.path)
+
+        # 2. load global env
+        g_env = environment.Environment({}, user_env=False)
+        with mock.patch('heat.engine.environment.open',
+                        mock.mock_open(read_data=g_env_content),
+                        create=True) as m_open:
+            resources._load_global_environment(g_env)
+
+        # 3. assert that the file were ignored
+        expected = [mock.call('%s/a.yaml' % envdir.path),
+                    mock.call('%s/b.yaml' % envdir.path)]
+        call_list = m_open.call_args_list
+
+        expected.sort()
+        call_list.sort()
+
+        self.assertEqual(expected, call_list)

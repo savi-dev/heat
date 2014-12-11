@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,18 +14,22 @@
 """
 endpoint for heat AWS-compatible CloudWatch API
 """
+from oslo import messaging
+import six
+
 from heat.api.aws import exception
 from heat.api.aws import utils as api_utils
-from heat.common import wsgi
-from heat.common import policy
 from heat.common import exception as heat_exception
-from heat.rpc import client as rpc_client
-from heat.rpc import api as engine_api
-
-import heat.openstack.common.rpc.common as rpc_common
+from heat.common.i18n import _
+from heat.common.i18n import _LE
+from heat.common.i18n import _LW
+from heat.common import policy
+from heat.common import wsgi
 from heat.openstack.common import log as logging
+from heat.rpc import api as engine_api
+from heat.rpc import client as rpc_client
 
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 class WatchController(object):
@@ -39,17 +41,17 @@ class WatchController(object):
 
     def __init__(self, options):
         self.options = options
-        self.engine_rpcapi = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
         self.policy = policy.Enforcer(scope='cloudwatch')
 
     def _enforce(self, req, action):
         """Authorize an action against the policy.json."""
         try:
-            self.policy.enforce(req.context, action, {})
+            self.policy.enforce(req.context, action)
         except heat_exception.Forbidden:
             msg = _("Action %s not allowed for user") % action
             raise exception.HeatAccessDeniedError(msg)
-        except Exception as ex:
+        except Exception:
             # We expect policy.enforce to either pass or raise Forbidden
             # however, if anything else happens, we want to raise
             # HeatInternalFailureError, failure to do this results in
@@ -138,8 +140,8 @@ class WatchController(object):
             name = None
 
         try:
-            watch_list = self.engine_rpcapi.show_watch(con, watch_name=name)
-        except rpc_common.RemoteError as ex:
+            watch_list = self.rpc_client.show_watch(con, watch_name=name)
+        except messaging.RemoteError as ex:
             return exception.map_remote_error(ex)
 
         res = {'MetricAlarms': [format_metric_alarm(a)
@@ -184,13 +186,14 @@ class WatchController(object):
         """
         self._enforce(req, 'ListMetrics')
 
-        def format_metric_data(d, fil={}):
+        def format_metric_data(d, fil=None):
             """
             Reformat engine output into the AWS "Metric" format
             Takes an optional filter dict, which is traversed
             so a metric dict is only returned if all keys match
             the filter dict
             """
+            fil = fil or {}
             dimensions = [
                 {'AlarmName': d[engine_api.WATCH_DATA_ALARM]},
                 {'Timestamp': d[engine_api.WATCH_DATA_TIME]}
@@ -213,25 +216,25 @@ class WatchController(object):
                         # Filter criteria not met, return None
                         return
                 except KeyError:
-                    logger.warning("Invalid filter key %s, ignoring" % f)
+                    LOG.warn(_LW("Invalid filter key %s, ignoring"), f)
 
             return result
 
         con = req.context
         parms = dict(req.params)
         # FIXME : Don't yet handle filtering by Dimensions
-        filter_result = dict((k, v) for (k, v) in parms.iteritems() if k in
+        filter_result = dict((k, v) for (k, v) in six.iteritems(parms) if k in
                              ("MetricName", "Namespace"))
-        logger.debug("filter parameters : %s" % filter_result)
+        LOG.debug("filter parameters : %s" % filter_result)
 
         try:
             # Engine does not currently support query by namespace/metric
             # so we pass None/None and do any filtering locally
             null_kwargs = {'metric_namespace': None,
                            'metric_name': None}
-            watch_data = self.engine_rpcapi.show_watch_metric(con,
-                                                              **null_kwargs)
-        except rpc_common.RemoteError as ex:
+            watch_data = self.rpc_client.show_watch_metric(con,
+                                                           **null_kwargs)
+        except messaging.RemoteError as ex:
             return exception.map_remote_error(ex)
 
         res = {'Metrics': []}
@@ -268,7 +271,7 @@ class WatchController(object):
         # need to process (each dict) for dimensions
         metric_data = api_utils.extract_param_list(parms, prefix='MetricData')
         if not len(metric_data):
-            logger.error("Request does not contain required MetricData")
+            LOG.error(_LE("Request does not contain required MetricData"))
             return exception.HeatMissingParameterError("MetricData list")
 
         watch_name = None
@@ -293,8 +296,8 @@ class WatchController(object):
                     'Dimensions': dimensions}}
 
         try:
-            self.engine_rpcapi.create_watch_data(con, watch_name, data)
-        except rpc_common.RemoteError as ex:
+            self.rpc_client.create_watch_data(con, watch_name, data)
+        except messaging.RemoteError as ex:
             return exception.map_remote_error(ex)
 
         result = {'ResponseMetadata': None}
@@ -323,23 +326,15 @@ class WatchController(object):
                     'expecting one of %(expect)s') % {
                         'state': state,
                         'expect': state_map.keys()}
-            logger.error(msg)
+            LOG.error(msg)
             return exception.HeatInvalidParameterValueError(msg)
 
-        # Check for optional parameters
-        # FIXME : We don't actually do anything with these in the engine yet..
-        state_reason = None
-        state_reason_data = None
-        if 'StateReason' in parms:
-            state_reason = parms['StateReason']
-        if 'StateReasonData' in parms:
-            state_reason_data = parms['StateReasonData']
-
-        logger.debug("setting %s to %s" % (name, state_map[state]))
+        LOG.debug("setting %(name)s to %(state)s" % {
+                  'name': name, 'state': state_map[state]})
         try:
-            self.engine_rpcapi.set_watch_state(con, watch_name=name,
-                                               state=state_map[state])
-        except rpc_common.RemoteError as ex:
+            self.rpc_client.set_watch_state(con, watch_name=name,
+                                            state=state_map[state])
+        except messaging.RemoteError as ex:
             return exception.map_remote_error(ex)
 
         return api_utils.format_response("SetAlarmState", "")

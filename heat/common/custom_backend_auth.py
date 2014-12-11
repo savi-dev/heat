@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+#
 # Copyright (C) 2012, Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +20,11 @@ Middleware for authenticating against custom backends.
 
 import logging
 
-from heat.openstack.common import local
-from heat.rpc import client as rpc_client
 import webob.exc
 
+from heat.openstack.common.gettextutils import _
+from heat.openstack.common import local
+from heat.rpc import client as rpc_client
 
 LOG = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class AuthProtocol(object):
     def __init__(self, app, conf):
         self.conf = conf
         self.app = app
+        self.rpc_client = rpc_client.EngineClient()
 
     def __call__(self, env, start_response):
         """
@@ -43,8 +44,7 @@ class AuthProtocol(object):
         """
         LOG.debug('Authenticating user token')
         context = local.store.context
-        engine = rpc_client.EngineClient()
-        authenticated = engine.authenticated_to_backend(context)
+        authenticated = self.rpc_client.authenticated_to_backend(context)
         if authenticated:
             return self.app(env, start_response)
         else:
@@ -58,7 +58,8 @@ class AuthProtocol(object):
         :param start_response: wsgi response callback
         :returns HTTPUnauthorized http response
         """
-        resp = webob.exc.HTTPUnauthorized("Backend authentication failed", [])
+        resp = webob.exc.HTTPUnauthorized(_("Backend authentication failed"),
+                                          [])
         return resp(env, start_response)
 
 

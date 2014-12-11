@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,6 +14,7 @@
 from webob import exc
 
 from heat.api.openstack.v1 import util
+from heat.common import serializers
 from heat.common import wsgi
 from heat.rpc import client as rpc_client
 
@@ -25,20 +24,26 @@ class ActionController(object):
     WSGI controller for Actions in Heat v1 API
     Implements the API for stack actions
     """
+    # Define request scope (must match what is in policy.json)
+    REQUEST_SCOPE = 'actions'
 
-    ACTIONS = (SUSPEND, RESUME) = ('suspend', 'resume')
+    ACTIONS = (
+        SUSPEND, RESUME, CHECK, CANCEL_UPDATE
+    ) = (
+        'suspend', 'resume', 'check', 'cancel_update'
+    )
 
     def __init__(self, options):
         self.options = options
-        self.engine = rpc_client.EngineClient()
+        self.rpc_client = rpc_client.EngineClient()
 
     @util.identified_stack
-    def action(self, req, identity, body={}):
+    def action(self, req, identity, body=None):
         """
         Performs a specified action on a stack, the body is expecting to
         contain exactly one item whose key specifies the action
         """
-
+        body = body or {}
         if len(body) < 1:
             raise exc.HTTPBadRequest(_("No action specified"))
 
@@ -50,9 +55,13 @@ class ActionController(object):
             raise exc.HTTPBadRequest(_("Invalid action %s specified") % ac)
 
         if ac == self.SUSPEND:
-            res = self.engine.stack_suspend(req.context, identity)
+            self.rpc_client.stack_suspend(req.context, identity)
         elif ac == self.RESUME:
-            res = self.engine.stack_resume(req.context, identity)
+            self.rpc_client.stack_resume(req.context, identity)
+        elif ac == self.CHECK:
+            self.rpc_client.stack_check(req.context, identity)
+        elif ac == self.CANCEL_UPDATE:
+            self.rpc_client.stack_cancel_update(req.context, identity)
         else:
             raise exc.HTTPInternalServerError(_("Unexpected action %s") % ac)
 
@@ -61,7 +70,6 @@ def create_resource(options):
     """
     Actions action factory method.
     """
-    # TODO(zaneb) handle XML based on Content-type/Accepts
     deserializer = wsgi.JSONRequestDeserializer()
-    serializer = wsgi.JSONResponseSerializer()
+    serializer = serializers.JSONResponseSerializer()
     return wsgi.Resource(ActionController(options), deserializer, serializer)
