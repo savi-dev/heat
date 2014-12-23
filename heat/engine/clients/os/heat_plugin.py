@@ -42,6 +42,9 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
             args['password'] = self.context.password
             del(args['token'])
 
+        if self.context.region_name is not None:
+            args['region_name'] = self.context.region_name
+
         return hc.Client('1', endpoint, **args)
 
     def is_not_found(self, ex):
