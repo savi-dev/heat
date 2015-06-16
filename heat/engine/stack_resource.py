@@ -16,7 +16,6 @@ import hashlib
 from oslo.config import cfg
 from oslo.serialization import jsonutils
 
-from heat.common import environment_format
 from heat.common import exception
 from heat.common.i18n import _
 from heat.engine import attributes
@@ -58,6 +57,12 @@ class StackResource(resource.Resource):
             self.attributes = attributes.Attributes(self.name,
                                                     self.attributes_schema,
                                                     self._resolve_attribute)
+
+    def _needs_update(self, after, before, after_props, before_props,
+                      prev_resource):
+        # Always issue an update to the nested stack and let the individual
+        # resources in it decide if they need updating.
+        return True
 
     def nested(self):
         '''
@@ -145,10 +150,13 @@ class StackResource(resource.Resource):
 
         # Note we disable rollback for nested stacks, since they
         # should be rolled back by the parent stack on failure
+        child_env = environment.get_custom_environment(
+            self.stack.env.registry,
+            child_params)
         nested = parser.Stack(self.context,
                               stack_name,
                               parsed_template,
-                              self._nested_environment(child_params),
+                              child_env,
                               timeout_mins=timeout_mins,
                               disable_rollback=True,
                               parent_resource=self,
@@ -170,23 +178,6 @@ class StackResource(resource.Resource):
         if (total_resources > cfg.CONF.max_resources_per_stack):
             message = exception.StackResourceLimitExceeded.msg_fmt
             raise exception.RequestLimitExceeded(message=message)
-
-    def _nested_environment(self, user_params):
-        """Build a sensible environment for the nested stack.
-
-        This is built from the user_params and the parent stack's registry
-        so we can use user-defined resources within nested stacks.
-        """
-        nested_env = environment.Environment()
-        nested_env.registry = self.stack.env.registry
-        user_env = {environment_format.PARAMETERS: {}}
-        if user_params is not None:
-            if environment_format.PARAMETERS not in user_params:
-                user_env[environment_format.PARAMETERS] = user_params
-            else:
-                user_env.update(user_params)
-        nested_env.load(user_env)
-        return nested_env
 
     def create_with_template(self, child_template, user_params,
                              timeout_mins=None, adopt_data=None):

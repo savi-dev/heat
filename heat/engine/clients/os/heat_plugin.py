@@ -25,8 +25,8 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
         args = {
             'auth_url': self.context.auth_url,
             'token': self.auth_token,
-            'username': None,
-            'password': None,
+            'username': self.context.username,
+            'password': self.context.password,
             'ca_file': self._get_client_option('heat', 'ca_file'),
             'cert_file': self._get_client_option('heat', 'cert_file'),
             'key_file': self._get_client_option('heat', 'key_file'),
@@ -41,6 +41,9 @@ class HeatClientPlugin(client_plugin.ClientPlugin):
             args['username'] = self.context.username
             args['password'] = self.context.password
             del(args['token'])
+
+        if self.context.region_name is not None:
+            args['region_name'] = self.context.region_name
 
         return hc.Client('1', endpoint, **args)
 

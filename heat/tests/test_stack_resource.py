@@ -152,7 +152,7 @@ class StackResourceTest(HeatTestCase):
         self.stack = self.parent_resource.nested()
         self.assertEqual({"foo": "bar"}, self.stack.t.files)
 
-    @mock.patch.object(stack_resource.StackResource, '_nested_environment')
+    @mock.patch('heat.engine.environment.get_custom_environment')
     @mock.patch.object(stack_resource.parser, 'Stack')
     def test_preview_with_implemented_child_resource(self, mock_stack_class,
                                                      mock_env_class):
@@ -173,7 +173,8 @@ class StackResourceTest(HeatTestCase):
         parent_resource._validate_nested_resources = validation_mock
 
         result = parent_resource.preview()
-        mock_env_class.assert_called_once_with(params)
+        mock_env_class.assert_called_once_with(self.parent_stack.env.registry,
+                                               params)
         self.assertEqual('preview_nested_stack', result)
         mock_stack_class.assert_called_once_with(
             mock.ANY,
@@ -189,7 +190,7 @@ class StackResourceTest(HeatTestCase):
             adopt_stack_data=None,
         )
 
-    @mock.patch.object(stack_resource.StackResource, '_nested_environment')
+    @mock.patch('heat.engine.environment.get_custom_environment')
     @mock.patch.object(stack_resource.parser, 'Stack')
     def test_preview_with_implemented_dict_child_resource(self,
                                                           mock_stack_class,
@@ -211,7 +212,8 @@ class StackResourceTest(HeatTestCase):
         parent_resource._validate_nested_resources = validation_mock
 
         result = parent_resource.preview()
-        mock_env_class.assert_called_once_with(params)
+        mock_env_class.assert_called_once_with(self.parent_stack.env.registry,
+                                               params)
         self.assertEqual('preview_nested_stack', result)
         mock_stack_class.assert_called_once_with(
             mock.ANY,
